@@ -51,18 +51,18 @@ dependencies = [
 
 [[package]]
 name = "lumen"
-version = "0.1.1"
+version = "0.1.2"
 
 [[package]]
 name = "lumen-difftest"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "lumen",
 ]
 
 [[package]]
 name = "lumen-wasm"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "js-sys",
  "lumen",
@@ -124,7 +124,7 @@ dependencies = [
 
 [[package]]
 name = "test262-runner"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "lumen",
 ]
