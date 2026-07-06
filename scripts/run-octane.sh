@@ -13,6 +13,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=scripts/lib/bench.sh
+. "$ROOT/scripts/lib/bench.sh"
 OCTANE="${OCTANE:-$ROOT/../octane}"
 
 if [ ! -d "$OCTANE" ] || [ ! -f "$OCTANE/base.js" ] || [ ! -f "$OCTANE/run.js" ]; then
@@ -22,45 +24,57 @@ if [ ! -d "$OCTANE" ] || [ ! -f "$OCTANE/base.js" ] || [ ! -f "$OCTANE/run.js" ]
   exit 1
 fi
 
-if [ $# -ge 1 ]; then
-  SUITES=("$@")
-else
-  SUITES=(richards deltablue crypto raytrace earley-boyer regexp splay navier-stokes \
-          pdfjs mandreel gbemu code-load box2d zlib typescript)
+# The benchmark files and their order come straight from Octane's own run.js
+# `load()` manifest, so the runnable set tracks upstream instead of a hardcoded
+# table. base.js is the harness (added separately, first); the rest are benchmarks.
+MANIFEST=()
+while IFS= read -r f; do
+  [ "$f" = "base.js" ] && continue
+  MANIFEST+=("$f")
+done < <(sed -n "s/^load([^']*'\([^']*\.js\)').*/\1/p" "$OCTANE/run.js")
+
+if [ ${#MANIFEST[@]} -eq 0 ]; then
+  echo "error: no load('...js') entries found in $OCTANE/run.js" >&2
+  exit 1
 fi
 
 # Expand and validate the requested suites into a file list *before* building, so
-# a typo fails in milliseconds instead of after a multi-minute release build.
+# a typo fails in milliseconds instead of after a multi-minute release build. A
+# suite name matches its own file plus any hyphenated parts — `zlib` picks up
+# zlib.js + zlib-data.js, `gbemu` picks up gbemu-part1.js + gbemu-part2.js — and
+# a trailing `.js` (e.g. from tab-completion) is tolerated.
 SUITE_FILES=()
-for s in "${SUITES[@]}"; do
-  case "${s%.js}" in   # tolerate a trailing `.js` (e.g. from tab-completion)
-    gbemu) files=(gbemu-part1.js gbemu-part2.js) ;;
-    zlib) files=(zlib.js zlib-data.js) ;;
-    typescript) files=(typescript.js typescript-input.js typescript-compiler.js) ;;
-    *) files=("${s%.js}.js") ;;
-  esac
-  for f in "${files[@]}"; do
-    if [ ! -f "$OCTANE/$f" ]; then
-      echo "error: unknown/missing Octane suite file: $OCTANE/$f (from suite '$s')" >&2
+if [ $# -ge 1 ]; then
+  for arg in "$@"; do
+    name="${arg%.js}"
+    matched=0
+    for f in "${MANIFEST[@]}"; do
+      case "$f" in
+        "$name.js" | "$name"-*.js)
+          SUITE_FILES+=("$OCTANE/$f")
+          matched=1
+          ;;
+      esac
+    done
+    if [ "$matched" -eq 0 ]; then
+      echo "error: unknown Octane suite '$arg' (no matching file in $OCTANE/run.js)" >&2
       exit 1
     fi
+  done
+else
+  for f in "${MANIFEST[@]}"; do
     SUITE_FILES+=("$OCTANE/$f")
   done
-done
-
-# Build the CLI in release mode unless the caller supplied a prebuilt binary.
-if [ -z "${LUMEN_BIN:-}" ]; then
-  cargo build --release -q -p lumen --bin lumen
-  LUMEN_BIN="$ROOT/target/release/lumen"
 fi
+
+LUMEN_BIN="$(bench_lumen_bin "$ROOT")"
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 DRIVER="$WORK/octane-driver.js"
 OUTPUT="$WORK/octane-output"
 
-# The upstream driver uses the shell `load()`; the lumen CLI takes files in sequence instead.
-sed '/^load(/d' "$OCTANE/run.js" > "$DRIVER"
+bench_strip_load "$OCTANE/run.js" "$DRIVER"
 
 ARGS=("$OCTANE/base.js" "${SUITE_FILES[@]}" "$DRIVER")
 

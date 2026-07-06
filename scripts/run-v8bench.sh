@@ -7,9 +7,12 @@
 #
 #   scripts/run-v8bench.sh              # full suite
 #   scripts/run-v8bench.sh richards     # one benchmark (any of the .js basenames)
+#   LUMEN_BIN=/path/to/lumen scripts/run-v8bench.sh   # skip the build, use this binary
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=scripts/lib/bench.sh
+. "$ROOT/scripts/lib/bench.sh"
 DEST="$ROOT/v8-v7"
 RAW="https://raw.githubusercontent.com/mozilla/arewefastyet/master/benchmarks/v8-v7"
 FILES=(base.js richards.js deltablue.js crypto.js raytrace.js earley-boyer.js regexp.js splay.js navier-stokes.js run.js)
@@ -23,9 +26,7 @@ if [ ! -f "$DEST/base.js" ]; then
 fi
 
 # The upstream driver uses the shell `load()`; the lumen CLI takes files in sequence instead.
-sed '/^load(/d' "$DEST/run.js" > "$DEST/driver.js"
-
-cargo build --release -q -p lumen --bin lumen
+bench_strip_load "$DEST/run.js" "$DEST/driver.js"
 
 if [ $# -ge 1 ]; then
   SUITES=("$@")
@@ -39,4 +40,5 @@ for s in "${SUITES[@]}"; do
 done
 ARGS+=("$DEST/driver.js")
 
-exec "$ROOT/target/release/lumen" "${ARGS[@]}"
+LUMEN_BIN="$(bench_lumen_bin "$ROOT")"
+exec "$LUMEN_BIN" "${ARGS[@]}"

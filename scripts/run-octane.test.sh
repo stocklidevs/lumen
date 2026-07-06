@@ -106,9 +106,29 @@ write_fake_octane() {
   rm -rf "$FAKE_OCTANE"
   mkdir -p "$FAKE_OCTANE"
   printf 'base\n' > "$FAKE_OCTANE/base.js"
+  # Mirror the real chromium/octane run.js: single-quoted load() lines the runner
+  # parses as its suite manifest, plus a non-load line that becomes the driver.
   cat > "$FAKE_OCTANE/run.js" <<'JS'
-load("base.js");
-load("richards.js");
+load('base.js');
+load('richards.js');
+load('deltablue.js');
+load('crypto.js');
+load('raytrace.js');
+load('earley-boyer.js');
+load('regexp.js');
+load('splay.js');
+load('navier-stokes.js');
+load('pdfjs.js');
+load('mandreel.js');
+load('gbemu-part1.js');
+load('gbemu-part2.js');
+load('code-load.js');
+load('box2d.js');
+load('zlib.js');
+load('zlib-data.js');
+load('typescript.js');
+load('typescript-input.js');
+load('typescript-compiler.js');
 print("driver");
 JS
 
@@ -208,7 +228,7 @@ test_unknown_suite_fails_before_build() {
   # No LUMEN_BIN: suite validation must reject the typo before the release build.
   run_expect_failure env OCTANE="$FAKE_OCTANE" "$SCRIPT" nope
 
-  assert_contains "$STDERR_LOG" "error: unknown/missing Octane suite file: $FAKE_OCTANE/nope.js (from suite 'nope')"
+  assert_contains "$STDERR_LOG" "error: unknown Octane suite 'nope' (no matching file in $FAKE_OCTANE/run.js)"
   if [ -f "$CARGO_LOG" ]; then
     fail "suite validation must run before the release build"
   fi
