@@ -51,6 +51,11 @@ On top of that:
   implemented on std alone and no third-party crate is permitted, so `https` URLs reject with
   a clear error; plain `http` works.
 
+  `Lumen.serve((request) => Response)` is the matching HTTP/1.1 **server** — not a WinterTC API,
+  but the cross-runtime `serve(handler)` convention (Deno/Bun/Workers), so a Hono app runs with
+  `Lumen.serve(app.fetch)`. v1 is single-accept, `Connection: close`, buffered bodies, http only
+  (see `crates/lumen-web/src/server.rs`). Cold-start and usage: `examples/hono-app`.
+
 - **Modules — both CommonJS and ESM.** `lumen-cli` picks the module kind the way Node does:
   `.mjs` is ESM, `.cjs` is CommonJS, `.js` follows the nearest `package.json` `"type"`. ES
   modules run through the engine's real module graph (linking, top-level `await`); `import`
@@ -62,7 +67,18 @@ On top of that:
   resolution and the module wrapper, `package.json` `main`/`exports`, the `node:path`/
   `node:os`/`node:fs` builtins, and `Buffer`, so packages written against the `node:` surface
   run. See the checklist at the top of `crates/lumen-node/src/lib.rs` for the deferred pieces
-  (subpath-pattern exports, native addons).
+  (subpath-pattern exports, the full N-API surface).
+
+  **Native addons** load too: `require('./addon.node')` dlopens the compiled library and runs its
+  N-API registration, resolving the addon's `napi_*` symbols against the lumen executable — the
+  same mechanism the `node` binary uses. The N-API surface is implemented from scratch (values,
+  properties, functions, callbacks, errors, references, object wrap, classes, promises, buffers,
+  typed arrays, async work); the loader reaches `dlopen`/`dlsym` through raw `extern "C"`
+  declarations, so no third-party crate is added. See `examples/native-addon`.
+
+  **`vite build` runs on lumen** (`examples/vite-app`): a full Vite production build, bundling
+  through Rollup's native N-API addon, transforming with esbuild's service subprocess, over
+  ESM↔CommonJS interop and the `node:` surface — building `dist/` and exiting cleanly.
 
 - **REPL + CLI** (`lumen-repl`, `lumen-cli`) — an interactive shell with a persistent realm,
   parser-driven incomplete-input detection (multi-line continuation), top-level `await`, and
@@ -86,6 +102,18 @@ lumen-cli      node/deno-style entrypoint
 
 The dependency graph is a strict DAG — `lumen ← lumen-host ← {op crates} ← lumen-runtime ←
 lumen-repl ← lumen-cli` — so each op crate can be worked on in isolation.
+
+## Install
+
+Grab a prebuilt runtime for your platform (macOS arm64, Linux x86_64/arm64):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/lucid-softworks/lumen/main/scripts/install.sh | bash
+```
+
+It installs the `lumen` CLI to `~/.lumen/bin` from the rolling `nightly` release
+(`LUMEN_INSTALL` and `LUMEN_RELEASE` override the location and tag). Other platforms build from
+source — see below.
 
 ## Usage
 

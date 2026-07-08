@@ -16,8 +16,13 @@
 //!   syscalls, no crates), `crypto.subtle.digest` (SHA-256 only)
 //! - [x] `fetch` / `Headers` / `Request` / `Response` — **http only**: TLS cannot be built on
 //!   std and is not implemented (STOP-AND-FLAG); https rejects with a clear error
-//! - [ ] Streams (`ReadableStream`/`WritableStream`/`TransformStream`) — the largest gap;
-//!   response bodies are buffered, not streamed
+//! - [~] `Lumen.serve` — an HTTP/1.1 *server* (not a WinterTC API; follows the cross-runtime
+//!   `serve((request) => Response)` convention of Deno/Bun/Workers). v1 is single-accept,
+//!   `Connection: close`, buffered bodies, http only — see `server.rs` for what's deferred.
+//! - [~] Streams: `ReadableStream` (default reader, async iteration, `getReader`/`cancel`/
+//!   `values`) backing Request/Response `.body` over the buffered bytes; no BYOB/byte streams,
+//!   `tee()`, piping, `WritableStream`, or `TransformStream` yet. Bodies remain buffered, so a
+//!   stream used as a body must produce its data synchronously.
 //! - [ ] `Blob` / `File` / `FormData`, `URLPattern`, `TextEncoderStream`/`TextDecoderStream`,
 //!   `crypto.subtle` beyond digest, `WebSocket`, compression streams
 
@@ -29,21 +34,40 @@ use std::time::Instant;
 use lumen_host::{ops, Ctx, Extension, OpState, SpawnHandle, TaskRegistry, Value};
 
 mod http;
+mod server;
 mod sha256;
 mod url;
+// The decoder parses the whole binary format; the MVP interpreter doesn't consume every field yet
+// (reserved value-type data, mutability flags, etc.), and a few opcode matches read cleaner as
+// explicit lists than ranges.
+#[allow(dead_code, clippy::manual_range_patterns)]
+mod wasm;
+mod wasm_ops;
 
 pub fn extension() -> Extension {
     Extension {
         name: "web",
         globals: &[],
         namespaces: &[
-            ("performance", ops!["now" (0) => op_perf_now]),
+            (
+                "__perf",
+                ops!["now" (0) => op_perf_now, "timeOrigin" (0) => op_time_origin],
+            ),
             (
                 "__encoding",
                 ops!["encode" (1) => op_encode, "decode" (2) => op_decode],
             ),
             ("__url", ops!["parse" (2) => op_url_parse]),
             ("__http", ops!["request" (6) => op_http_request]),
+            (
+                "__http_server",
+                ops![
+                    "listen" (3) => server::op_server_listen,
+                    "respond" (7) => server::op_server_respond,
+                    "close" (1) => server::op_server_close,
+                    "version" (0) => server::op_server_version,
+                ],
+            ),
             (
                 "__crypto",
                 ops![
@@ -52,38 +76,93 @@ pub fn extension() -> Extension {
                     "sha256" (1) => op_sha256,
                 ],
             ),
+            (
+                "__compress",
+                ops![
+                    "deflate" (1) => op_deflate,
+                    "inflate" (1) => op_inflate,
+                    "deflateRaw" (1) => op_deflate_raw,
+                    "inflateRaw" (1) => op_inflate_raw,
+                    "gzip" (1) => op_gzip,
+                    "gunzip" (1) => op_gunzip,
+                ],
+            ),
+            (
+                "__wasm",
+                ops![
+                    "validate" (1) => wasm_ops::op_validate,
+                    "compile" (1) => wasm_ops::op_compile,
+                    "moduleExports" (1) => wasm_ops::op_module_exports,
+                    "moduleImports" (1) => wasm_ops::op_module_imports,
+                    "allocMemory" (2) => wasm_ops::op_alloc_memory,
+                    "allocTable" (2) => wasm_ops::op_alloc_table,
+                    "allocGlobal" (3) => wasm_ops::op_alloc_global,
+                    "instantiate" (2) => wasm_ops::op_instantiate,
+                    "call" (2) => wasm_ops::op_call,
+                    "memBytes" (1) => wasm_ops::op_mem_bytes,
+                    "memWrite" (3) => wasm_ops::op_mem_write,
+                    "memGrow" (2) => wasm_ops::op_mem_grow,
+                    "tableGet" (2) => wasm_ops::op_table_get,
+                    "tableSet" (3) => wasm_ops::op_table_set,
+                    "tableSize" (1) => wasm_ops::op_table_size,
+                    "globalGet" (1) => wasm_ops::op_global_get,
+                    "globalSet" (2) => wasm_ops::op_global_set,
+                ],
+            ),
         ],
-        state_init: Some(|state: &mut OpState| state.put(WebState::default())),
+        state_init: Some(|state: &mut OpState| {
+            state.put(WebState::default());
+            state.put(server::ServerRegistry::default());
+            state.put(wasm_ops::WasmStore::default());
+        }),
         js_init: Some(JS_GLUE),
+        js_init_snapshot: Some(JS_GLUE_SNAPSHOT),
     }
 }
 
-/// One IIFE: the preamble captures and deletes the raw `__*` namespaces, the rest defines the
-/// standard classes over them.
-const JS_GLUE: &str = concat!(
-    "(() => {\n",
-    include_str!("js/preamble.js"),
-    include_str!("js/events.js"),
-    include_str!("js/encoding.js"),
-    include_str!("js/url.js"),
-    include_str!("js/fetch.js"),
-    include_str!("js/crypto.js"),
-    "\n})();"
-);
+/// One IIFE (preamble captures and deletes the raw `__*` namespaces, the rest defines the
+/// standard classes over them), assembled by `build.rs` from `src/js/*.js` — the single source
+/// of truth. `JS_GLUE` is the fallback source; `JS_GLUE_SNAPSHOT` is its precompiled AST, decoded
+/// at boot to skip re-parsing (see `lumen_host::install` / `Engine::eval_snapshot`).
+const JS_GLUE: &str = include_str!(concat!(env!("OUT_DIR"), "/web_glue.js"));
+const JS_GLUE_SNAPSHOT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/web_glue.snap"));
 
 #[derive(Default)]
 struct WebState {
-    /// `performance.now()`'s zero point (set at install = runtime construction).
+    /// `performance.now()`'s monotonic zero point and the wall-clock time (`timeOrigin`, Unix ms)
+    /// captured at the same instant — set together on first access.
     start: Option<Instant>,
+    time_origin_ms: f64,
     /// Cached `/dev/urandom` handle (macOS/Linux; the only randomness std can reach without
     /// syscalls or crates).
     urandom: Option<RefCell<File>>,
 }
 
+impl WebState {
+    /// The monotonic clock's zero point, initializing it (and the paired `timeOrigin`) on first use.
+    fn clock_start(&mut self) -> Instant {
+        if self.start.is_none() {
+            self.start = Some(Instant::now());
+            self.time_origin_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs_f64() * 1000.0)
+                .unwrap_or(0.0);
+        }
+        self.start.unwrap()
+    }
+}
+
 fn op_perf_now(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
     let state = ctx.host_mut::<WebState>().expect("web state installed");
-    let start = *state.start.get_or_insert_with(Instant::now);
+    let start = state.clock_start();
     Ok(Value::Num(start.elapsed().as_secs_f64() * 1000.0))
+}
+
+/// `performance.timeOrigin`: Unix-epoch milliseconds at the monotonic clock's zero point.
+fn op_time_origin(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+    let state = ctx.host_mut::<WebState>().expect("web state installed");
+    state.clock_start();
+    Ok(Value::Num(state.time_origin_ms))
 }
 
 // ---- encoding ----
@@ -207,6 +286,54 @@ fn op_sha256(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value
     ctx.make_uint8array(&digest)
 }
 
+// ---- compression (DEFLATE/zlib/gzip, backing CompressionStream/DecompressionStream) ----
+
+fn compress_op(
+    ctx: &mut Ctx,
+    args: &[Value],
+    codec: fn(&[u8]) -> Vec<u8>,
+) -> Result<Value, Value> {
+    let v = args.first().unwrap_or(&Value::Undefined);
+    let Some(bytes) = ctx.typed_array_bytes(v) else {
+        return Err(ctx.make_error("TypeError", "compression expects a BufferSource"));
+    };
+    ctx.make_uint8array(&codec(&bytes))
+}
+
+fn decompress_op(
+    ctx: &mut Ctx,
+    args: &[Value],
+    codec: fn(&[u8]) -> Result<Vec<u8>, String>,
+) -> Result<Value, Value> {
+    let v = args.first().unwrap_or(&Value::Undefined);
+    let Some(bytes) = ctx.typed_array_bytes(v) else {
+        return Err(ctx.make_error("TypeError", "decompression expects a BufferSource"));
+    };
+    match codec(&bytes) {
+        Ok(out) => ctx.make_uint8array(&out),
+        Err(e) => Err(ctx.make_error("TypeError", e)),
+    }
+}
+
+fn op_deflate(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
+    compress_op(ctx, a, lumen_host::deflate::zlib_compress)
+}
+fn op_inflate(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
+    decompress_op(ctx, a, lumen_host::deflate::zlib_decompress)
+}
+fn op_deflate_raw(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
+    compress_op(ctx, a, lumen_host::deflate::deflate)
+}
+fn op_inflate_raw(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
+    decompress_op(ctx, a, lumen_host::deflate::inflate)
+}
+fn op_gzip(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
+    compress_op(ctx, a, lumen_host::deflate::gzip_compress)
+}
+fn op_gunzip(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
+    decompress_op(ctx, a, lumen_host::deflate::gzip_decompress)
+}
+
 // ---- fetch ----
 
 /// `(method, url, headerPairs, bodyOrUndefined, resolve, reject)`: one HTTP request on the
@@ -248,7 +375,7 @@ fn op_http_request(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
 }
 
 /// A JS `[[k, v], ...]` array into Rust pairs, via the curated member API.
-fn read_header_pairs(ctx: &mut Ctx, v: &Value) -> Result<Vec<(String, String)>, Value> {
+pub(crate) fn read_header_pairs(ctx: &mut Ctx, v: &Value) -> Result<Vec<(String, String)>, Value> {
     let mut out = Vec::new();
     if v.as_obj().is_none() {
         return Ok(out);

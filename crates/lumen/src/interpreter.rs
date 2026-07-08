@@ -158,6 +158,16 @@ pub struct FnFrame {
     pub lazy: Option<(Rc<crate::ast::Function>, Rc<[Value]>, Env)>,
 }
 
+/// Raw state of the last successful regex match, deferred for the legacy `RegExp.$1` statics.
+/// `ctor` is the %RegExp% constructor the statics belong to (the realm active at match time).
+pub(crate) struct RegexpLastMatch {
+    pub ctor: Gc,
+    pub input: Rc<str>,
+    pub text: Rc<crate::regex::ReText>,
+    pub caps: Vec<Option<(usize, usize)>>,
+    pub ngroups: usize,
+}
+
 pub struct Scope {
     pub vars: crate::fasthash::FastMap<String, Binding>,
     pub parent: Option<Env>,
@@ -545,6 +555,25 @@ pub struct Interp {
     pub(crate) tier: crate::bytecode::Tier,
     /// Calls before an eligible function tier-ups to bytecode (env `LUMEN_TIER_THRESHOLD`).
     pub(crate) tier_threshold: u32,
+    /// Recycled (slots, operand stack) buffers for bytecode-VM activations, so a hot call tree
+    /// doesn't allocate two `Vec`s per call (see `bytecode::run`).
+    pub(crate) vm_pool: Vec<(Vec<Value>, Vec<Value>)>,
+    /// Object-graph byte offsets the JIT's inline property-cache templates bake in (measured once;
+    /// see [`crate::value::jit_layout`]). Lazily computed on first JIT compile.
+    pub(crate) jit_layout: std::cell::OnceCell<crate::value::JitLayout>,
+    /// Whether the JIT's inline property caches are safe to run: they can't cheaply check the
+    /// exotic side tables (proxy / typed-array / module namespace / deferred namespace) from
+    /// machine code, so this flag latches *false* the first time any object is registered in one,
+    /// and the inline templates then fall through to the checked helper forever after. Monotonic
+    /// (never re-enabled), so it can only cost the inline speedup, never correctness.
+    pub(crate) inline_ic_safe: std::cell::Cell<bool>,
+    /// Recently prepared regex subjects keyed by string identity (the held `Rc` pins the
+    /// pointer), so repeated exec/replace/split over one subject reuses its element vector.
+    pub(crate) re_texts: Vec<(Rc<str>, bool, Rc<crate::regex::ReText>)>,
+    /// The last successful `exec` match, kept raw for the legacy `RegExp.$1`-style statics:
+    /// the 14 strings materialize into the constructor's hidden props only when an accessor
+    /// actually reads them (see `builtins::flush_regexp_legacy`), not on every match.
+    pub(crate) regexp_last: Option<RegexpLastMatch>,
     /// Live interpreter recursion depth (expression eval + calls). Bounded by [`MAX_EVAL_DEPTH`]
     /// so runaway recursion throws a RangeError instead of overflowing the native stack.
     pub(crate) depth: u32,
@@ -650,6 +679,10 @@ pub struct Interp {
     pub(crate) realms: crate::fasthash::FastMap<usize, RealmState>,
     /// Promise state keyed by the promise object's pointer.
     pub(crate) promises: crate::fasthash::FastMap<usize, PromiseState>,
+    /// Rejected promises with no handler attached at rejection time (ptr -> reason). Removed when a
+    /// handler is later attached; whatever remains after a microtask checkpoint is a genuine
+    /// unhandled rejection the embedder can report (see [`Engine::take_unhandled_rejections`]).
+    pub(crate) unhandled_rejections: crate::fasthash::FastMap<usize, Value>,
     /// Temporal object internal slots, keyed by the object's pointer.
     pub(crate) temporal: crate::fasthash::FastMap<usize, crate::temporal::Temporal>,
     /// The calendar id of a Temporal date-bearing object (default "iso8601"), keyed by object ptr.
@@ -1065,12 +1098,18 @@ impl Interp {
             module_ns: Default::default(),
             tier: match std::env::var("LUMEN_TIER").as_deref() {
                 Ok("bytecode") => crate::bytecode::Tier::Bytecode,
+                Ok("jit") => crate::bytecode::Tier::Jit,
                 _ => crate::bytecode::Tier::Interp,
             },
             tier_threshold: std::env::var("LUMEN_TIER_THRESHOLD")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(8),
+            vm_pool: Vec::new(),
+            jit_layout: std::cell::OnceCell::new(),
+            inline_ic_safe: std::cell::Cell::new(true),
+            re_texts: Vec::new(),
+            regexp_last: None,
             map_data: Default::default(),
             extra_protos: Default::default(),
             array_buffers: Default::default(),
@@ -1095,6 +1134,7 @@ impl Interp {
             ctor_caller_realm: None,
             realms: Default::default(),
             promises: Default::default(),
+            unhandled_rejections: Default::default(),
             temporal: Default::default(),
             temporal_cal: Default::default(),
             microtasks: std::collections::VecDeque::new(),
@@ -1158,7 +1198,7 @@ impl Interp {
             .cloned()
             .unwrap_or_else(|| self.error_protos["Error"].clone());
         let obj = Object::new(Some(proto));
-        obj.borrow_mut().exotic = Exotic::Error;
+        obj.borrow_mut().exotic = Exotic::Error(self.capture_stack());
         let msg = message.into();
         if !msg.is_empty() {
             obj.borrow_mut()
@@ -1167,6 +1207,27 @@ impl Interp {
         }
         Value::Obj(obj)
     }
+    /// Snapshot the current call stack as the `\n    at <fn>` lines for an error's `stack`.
+    /// Innermost frame first (Node order). We are a tree-walker without per-call source spans, so
+    /// frames carry the function name only (`<anonymous>` when unnamed); the `stack` getter adds
+    /// the `name: message` head. Bounded by the engine's own recursion guard (~128 frames).
+    fn capture_stack(&self) -> Rc<str> {
+        let mut out = String::new();
+        for frame in self.fn_frames.iter().rev() {
+            let name = frame
+                .fn_obj
+                .as_obj()
+                .and_then(|o| match &o.borrow().props.get("name")?.value {
+                    Value::Str(s) if !s.is_empty() => Some(s.to_string()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| "<anonymous>".to_string());
+            out.push_str("\n    at ");
+            out.push_str(&name);
+        }
+        Rc::from(out.as_str())
+    }
+
     pub fn throw(&self, kind: &str, message: impl Into<String>) -> Abrupt {
         Abrupt::Throw(self.make_error(kind, message))
     }
@@ -1406,14 +1467,146 @@ impl Interp {
         Object::new(Some(self.object_proto.clone()))
     }
 
+    /// The global object (`globalThis`) as a value — for embedders that must expose it
+    /// (N-API's `napi_get_global`).
+    pub fn global_this(&self) -> Value {
+        Value::Obj(self.global.clone())
+    }
+
+    /// [[Get]] for embedders: like [`Self::get_member`] but surfaces a thrown value rather than
+    /// the crate-internal `Abrupt` completion, so op crates can propagate it as `Err(Value)`.
+    pub fn member_get(&mut self, base: &Value, key: &str) -> Result<Value, Value> {
+        self.get_member(base, key).map_err(|a| match a {
+            Abrupt::Throw(v) => v,
+            _ => self.make_error("Error", "unexpected non-throw completion during property get"),
+        })
+    }
+
+    /// [[Set]] for embedders (see [`Self::member_get`]).
+    pub fn member_set(&mut self, base: &Value, key: &str, value: Value) -> Result<(), Value> {
+        self.set_member(base, key, value).map_err(|a| match a {
+            Abrupt::Throw(v) => v,
+            _ => self.make_error("Error", "unexpected non-throw completion during property set"),
+        })
+    }
+
+    // ----- embed helpers for host addons (N-API) ---------------------------------------------
+
+    /// A stable identity for an object value (its heap address), or `None` for a non-object.
+    /// Used by host addons to key per-object native state (`napi_wrap`) and to implement `===`
+    /// on objects without exposing the object handle.
+    pub fn object_addr(&self, v: &Value) -> Option<usize> {
+        v.as_obj().map(|o| Rc::as_ptr(o) as usize)
+    }
+
+    /// `Object.getPrototypeOf(v)` — the value's `[[Prototype]]` (`null` when there is none).
+    pub fn prototype_of(&self, v: &Value) -> Value {
+        match v.as_obj().and_then(|o| o.borrow().proto.clone()) {
+            Some(p) => Value::Obj(p),
+            None => Value::Null,
+        }
+    }
+
+    /// Whether `v` is an Error object (has the error exotic on itself or anywhere up its
+    /// prototype chain — so subclass instances count too).
+    pub fn is_error_value(&self, v: &Value) -> bool {
+        let mut cur = v.as_obj().cloned();
+        while let Some(o) = cur {
+            if matches!(o.borrow().exotic, Exotic::Error(_)) {
+                return true;
+            }
+            cur = o.borrow().proto.clone();
+        }
+        false
+    }
+
+    /// The `===` (SameValueNonNumeric / strict-equality) predicate, for host addons.
+    pub fn values_strict_equal(&self, a: &Value, b: &Value) -> bool {
+        self.strict_equals(a, b)
+    }
+
+    /// Whether the current native call is a construct (`new`) — a native constructor uses this to
+    /// build its instance only under `new`.
+    pub fn is_constructing(&self) -> bool {
+        self.constructing
+    }
+
+    /// A fresh object with an explicit `[[Prototype]]` (`null` → no prototype). For host addons
+    /// creating instances with a class's prototype.
+    pub fn new_object_with_proto(&self, proto: &Value) -> Value {
+        Value::Obj(Object::new(proto.as_obj().cloned()))
+    }
+
+    /// Mark a native function as a constructor and wire up its `prototype`/`constructor` link, so
+    /// `new ctor()` is legal and instances inherit from `proto`. Both links are non-enumerable,
+    /// as for a JS `class`.
+    pub fn set_constructor_prototype(&self, ctor: &Value, proto: &Value) {
+        if let Some(c) = ctor.as_obj() {
+            c.borrow_mut().is_constructor = true;
+            c.borrow_mut()
+                .props
+                .insert("prototype", Property::data(proto.clone(), false, false, false));
+        }
+        if let Some(p) = proto.as_obj() {
+            p.borrow_mut()
+                .props
+                .insert("constructor", Property::data(ctor.clone(), true, false, true));
+        }
+    }
+
+    /// Define an accessor (getter/setter) property on `target`. For host addons registering class
+    /// accessors (`napi_define_class` with getter/setter descriptors).
+    pub fn define_accessor_value(
+        &self,
+        target: &Value,
+        name: &str,
+        get: Option<Value>,
+        set: Option<Value>,
+        enumerable: bool,
+    ) {
+        if let Some(o) = target.as_obj() {
+            o.borrow_mut().props.insert(
+                name,
+                Property { value: Value::Undefined, get, set, accessor: true, writable: false, enumerable, configurable: true },
+            );
+        }
+    }
+
+    /// A TypedArray's `(napi element-type code, byte length, data pointer)`, or `None` for a
+    /// non-typed-array. The pointer aliases the live backing store; it is valid until the buffer
+    /// is resized or detached. For `napi_get_typedarray_info`.
+    pub fn typed_array_raw(&mut self, v: &Value) -> Option<(u8, usize, *mut u8)> {
+        let obj = v.as_obj()?;
+        let info = self.typed_arrays.get(&(Rc::as_ptr(obj) as usize)).copied()?;
+        let len = self.ta_len(&info)?;
+        let (code, elem) = match info.kind {
+            crate::value::TaKind::I8 => (0u8, 1usize),
+            crate::value::TaKind::U8 => (1, 1),
+            crate::value::TaKind::U8Clamped => (2, 1),
+            crate::value::TaKind::I16 => (3, 2),
+            crate::value::TaKind::U16 => (4, 2),
+            crate::value::TaKind::I32 => (5, 4),
+            crate::value::TaKind::U32 => (6, 4),
+            crate::value::TaKind::F32 => (7, 4),
+            crate::value::TaKind::F64 => (8, 8),
+            crate::value::TaKind::I64 => (9, 8),
+            crate::value::TaKind::U64 => (10, 8),
+            crate::value::TaKind::F16 => (1, 2), // no N-API code for float16; report bytes
+        };
+        let byte_len = len * elem;
+        let buf = self.array_buffers.get_mut(&info.buffer)?;
+        let ptr = unsafe { buf.as_mut_ptr().add(info.offset) };
+        Some((code, byte_len, ptr))
+    }
+
     pub fn make_array(&self, items: Vec<Value>) -> Value {
         let obj = Object::new(Some(self.array_proto.clone()));
         obj.borrow_mut().exotic = Exotic::Array;
         let len = items.len();
         {
             let mut b = obj.borrow_mut();
-            for (i, v) in items.into_iter().enumerate() {
-                b.props.insert(i.to_string(), Property::plain(v));
+            for v in items {
+                b.props.push_dense(Property::plain(v));
             }
             b.props.insert(
                 "length",
@@ -1440,6 +1633,51 @@ impl Interp {
         }
         .or_else(|| Some(self.object_proto.clone()));
         Value::Obj(Object::new(proto))
+    }
+
+    /// Invoke a native callable (bare `fn` or data-carrying closure) — the shared body for the
+    /// call/construct/super dispatch paths.
+    pub(crate) fn dispatch_native(&mut self, call: &Callable, this: Value, args: &[Value]) -> Result<Value, Value> {
+        match call {
+            Callable::Native(f) => f(self, this, args),
+            Callable::NativeData(f) => {
+                let f = f.clone();
+                f(self, this, args)
+            }
+            _ => unreachable!("dispatch_native on a non-native callable"),
+        }
+    }
+
+    /// A function `Value` backed by a data-carrying native closure — the embedder API for host
+    /// functions that must capture state (N-API callbacks carrying a C fn pointer + `void*`).
+    pub fn new_native_fn(
+        &self,
+        name: &str,
+        len: usize,
+        f: std::rc::Rc<crate::value::NativeClosure>,
+    ) -> Value {
+        Value::Obj(self.make_native_closure(name, len, f))
+    }
+
+    /// A function object backed by a data-carrying native closure (see [`NativeClosure`]). Like
+    /// [`make_native`], but the callable can capture host state (used for N-API functions).
+    pub fn make_native_closure(
+        &self,
+        name: &str,
+        len: usize,
+        f: std::rc::Rc<crate::value::NativeClosure>,
+    ) -> Gc {
+        let obj = Object::new(Some(self.function_proto.clone()));
+        {
+            let mut b = obj.borrow_mut();
+            b.call = Callable::NativeData(f);
+            b.props.insert("length", Property::data(Value::Num(len as f64), false, false, true));
+            b.props.insert(
+                "name",
+                Property::data(Value::from_string(name.to_string()), false, false, true),
+            );
+        }
+        obj
     }
 
     pub fn make_native(&self, name: &str, len: usize, f: NativeFn) -> Gc {
@@ -1488,6 +1726,13 @@ impl Interp {
     /// shape a [`NativeFn`] returns, for native fns that call back into JS.
     pub fn invoke(&mut self, callee: Value, this: Value, args: &[Value]) -> Result<Value, Value> {
         self.call(callee, this, args).map_err(abrupt_value)
+    }
+
+    /// [`construct`](Interp::construct) with an abrupt completion lowered to the thrown value —
+    /// the embed-friendly `new callee(...args)` (used by N-API's `napi_new_instance` /
+    /// `napi_create_promise`).
+    pub fn construct_value(&mut self, callee: Value, args: &[Value]) -> Result<Value, Value> {
+        self.construct(callee, args).map_err(abrupt_value)
     }
 
     /// ToNumber with the abrupt completion lowered to the thrown value (see [`invoke`]).
@@ -1569,11 +1814,11 @@ impl Interp {
             let mut b = obj.borrow_mut();
             b.call = Callable::User(func, env);
             b.props.insert(
-                "length",
+                crate::value::fn_key(0), // "length"
                 Property::data(Value::Num(arity as f64), false, false, true),
             );
             b.props.insert(
-                "name",
+                crate::value::fn_key(1), // "name"
                 Property::data(Value::from_string(name), false, false, true),
             );
         }
@@ -1592,13 +1837,13 @@ impl Interp {
             let proto = Object::new(proto_parent);
             // A generator's `.prototype` has no own `constructor` (the methods live on the intrinsic).
             if !is_generator {
-                proto
-                    .borrow_mut()
-                    .props
-                    .insert("constructor", Property::builtin(Value::Obj(obj.clone())));
+                proto.borrow_mut().props.insert(
+                    crate::value::fn_key(3), // "constructor"
+                    Property::builtin(Value::Obj(obj.clone())),
+                );
             }
             obj.borrow_mut().props.insert(
-                "prototype",
+                crate::value::fn_key(2), // "prototype"
                 Property::data(Value::Obj(proto), true, false, false),
             );
         }
@@ -1673,6 +1918,221 @@ impl Interp {
             }
             _ => Err(v),
         }
+    }
+
+    /// `obj.name` read with a per-site inline cache (bytecode `GetProp`/`GetMethod`). The cache
+    /// holds where `name` was last found at this site: an own `entries` slot, or a slot on the
+    /// object `depth` prototype hops up (methods!). A hit re-validates everything it relies on —
+    /// each hop below the holder is hash-checked to still lack an own `name`, the holder slot is
+    /// key-compared — so staleness costs a re-derivation, never a wrong answer. Anything not a
+    /// plain data property on an ordinary (or array) chain falls through to full `[[Get]]`.
+    pub(crate) fn get_prop_ic(
+        &mut self,
+        base: &Value,
+        name: &str,
+        cache: &std::cell::Cell<crate::bytecode::IcState>,
+    ) -> Result<Value, Abrupt> {
+        match base {
+            Value::Obj(o) => {
+                if let Some(v) = self.try_ic_get(o, name, cache) {
+                    return Ok(v);
+                }
+            }
+            // Primitive receivers: named non-index reads (`"x".replace`, `(1).toFixed`) resolve
+            // on the wrapper prototype chain — cache that walk too. `length` and numeric keys
+            // have primitive-specific handling in get_member; symbols get description handling.
+            Value::Str(_) | Value::Num(_) | Value::Bool(_)
+                if name != "length"
+                    && name != "description"
+                    && !name.as_bytes().first().is_some_and(|b| b.is_ascii_digit()) =>
+            {
+                let proto = match base {
+                    Value::Str(_) => self.string_proto.clone(),
+                    Value::Num(_) => self.number_proto.clone(),
+                    _ => self.boolean_proto.clone(),
+                };
+                if let Some(v) = self.try_ic_get(&proto, name, cache) {
+                    return Ok(v);
+                }
+            }
+            _ => {}
+        }
+        self.get_member(base, name)
+    }
+
+    /// Whether object pointer `ptr` (holding `b`) reads like an ordinary object for IC purposes.
+    /// `Exotic::Array` is allowed: array *named* reads are ordinary (`length` is a real stored
+    /// property); everything else exotic (string wrappers, arguments, …) and anything in a side
+    /// table (proxy, namespace, typed array) is not.
+    #[inline]
+    fn ic_plain_ptr(&self, ptr: usize, b: &Object) -> bool {
+        matches!(b.exotic, Exotic::None | Exotic::Array) && self.ordinary_get_ptr(ptr)
+    }
+
+    /// The `GetProp`/`GetMethod` inline-cache fast path; `None` means "take the slow path".
+    ///
+    /// The prototype chain is walked by raw pointer with no `Gc` clones: every object on it is
+    /// transitively kept alive by `o` (which the caller holds) for the duration of this call, and
+    /// nothing mutates the chain here, so the pointers stay valid — this removes a refcount
+    /// bump+drop per hop on every property access.
+    fn try_ic_get(
+        &self,
+        o: &Gc,
+        name: &str,
+        cache: &std::cell::Cell<crate::bytecode::IcState>,
+    ) -> Option<Value> {
+        use crate::bytecode::{IcState, IC_EMPTY, IC_MAX_DEPTH};
+        type ObjCell = std::cell::RefCell<Object>;
+        let head = Rc::as_ptr(o);
+        let st = cache.get();
+        // Shape fast path: a `depth == 0` (own) or `depth == 1` (immediate-prototype, e.g. a
+        // method) hit on non-exotic ordinary objects validates by shape-id compares alone — no
+        // per-hop key or hash checks. Shapes are shared across structurally-identical objects, so
+        // an id recorded from one instance validates the same slot on any sibling instance. The
+        // proto is re-followed live and the holder's shape re-checked, so a proto swap or holder
+        // mutation is caught. Arrays / deeper chains / misses drop to the re-derive walk below.
+        if st.depth <= 1 && st.depth != IC_EMPTY {
+            unsafe {
+                let rb = (*head).borrow();
+                if matches!(rb.exotic, Exotic::None)
+                    && self.ordinary_get_ptr(head as usize)
+                    && rb.props.shape() == st.recv_shape
+                {
+                    if st.depth == 0 {
+                        if let Some((_, p)) = rb.props.entry_at(st.slot as usize) {
+                            if !p.accessor {
+                                return Some(p.value.clone());
+                            }
+                        }
+                    } else if let Some(pr) = rb.proto.as_ref() {
+                        let hp = Rc::as_ptr(pr);
+                        drop(rb); // holder is a different object; release the receiver borrow
+                        let hb = (*hp).borrow();
+                        if matches!(hb.exotic, Exotic::None)
+                            && self.ordinary_get_ptr(hp as usize)
+                            && hb.props.shape() == st.holder_shape
+                        {
+                            if let Some((_, p)) = hb.props.entry_at(st.slot as usize) {
+                                if !p.accessor {
+                                    return Some(p.value.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Re-derive: walk the chain by raw pointer (every object is kept alive transitively by
+        // `o`, nothing mutates during the read). On a plain data hit within reach record
+        // (depth, slot, receiver shape, holder shape); a non-plain level or accessor defers to
+        // full `[[Get]]`.
+        let recv_shape = unsafe { (*head).borrow().props.shape() };
+        let mut cur: *const ObjCell = head;
+        unsafe {
+            for depth in 0..=IC_MAX_DEPTH {
+                let b = (*cur).borrow();
+                if !self.ic_plain_ptr(cur as usize, &b) {
+                    return None;
+                }
+                if let Some(slot) = b.props.slot_of(name) {
+                    let (_, p) = b.props.entry_at(slot).unwrap();
+                    if p.accessor {
+                        return None; // getter — must run through [[Get]]
+                    }
+                    let v = p.value.clone();
+                    cache.set(IcState {
+                        depth,
+                        slot: slot as u32,
+                        recv_shape,
+                        holder_shape: b.props.shape(),
+                    });
+                    return Some(v);
+                }
+                match b.proto.as_ref() {
+                    Some(p) => cur = Rc::as_ptr(p),
+                    None => return None, // chain ended: absent property — slow path
+                }
+            }
+        }
+        None
+    }
+
+    /// `obj.name = v` write with a per-site inline cache (bytecode `SetProp`/`SetPropDrop`). The
+    /// fast path overwrites an existing own writable data property (OrdinarySet's winning case,
+    /// correct regardless of the prototype chain); everything else defers to full `[[Set]]`.
+    pub(crate) fn set_prop_ic(
+        &mut self,
+        base: &Value,
+        name: &str,
+        v: Value,
+        cache: &std::cell::Cell<crate::bytecode::IcState>,
+    ) -> Result<(), Abrupt> {
+        if let Value::Obj(o) = base {
+            if self.try_ic_set(o, name, &v, cache) {
+                return Ok(());
+            }
+        }
+        self.set_member(base, name, v)
+    }
+
+    /// The `SetProp` inline-cache fast path; `false` means "take the slow path". Writes cache
+    /// own slots only (`depth` 0): an own writable data property wins OrdinarySet regardless of
+    /// the prototype chain.
+    fn try_ic_set(
+        &self,
+        o: &Gc,
+        name: &str,
+        v: &Value,
+        cache: &std::cell::Cell<crate::bytecode::IcState>,
+    ) -> bool {
+        let mut b = o.borrow_mut();
+        if !matches!(b.exotic, Exotic::None) {
+            return false;
+        }
+        if !self.ordinary_get_ptr(Rc::as_ptr(o) as usize) {
+            return false;
+        }
+        let st = cache.get();
+        // Shape fast path (own writable data property): a shape match means `slot` still maps
+        // `name`; skip the key compare. `accessor`/`writable` are re-checked (an in-place
+        // defineProperty could have flipped them without changing the shape).
+        if st.depth == 0 && b.props.shape() == st.recv_shape {
+            if let Some((_, p)) = b.props.entry_at(st.slot as usize) {
+                if !p.accessor && p.writable {
+                    b.props.entry_at_mut(st.slot as usize).unwrap().1.value = v.clone();
+                    return true;
+                }
+            }
+        }
+        match b.props.slot_of(name) {
+            Some(slot) => {
+                let p = &b.props.entry_at(slot).unwrap().1;
+                if p.accessor || !p.writable {
+                    return false; // setter, or non-writable (strict-throw) — slow path
+                }
+                let shape = b.props.shape();
+                b.props.entry_at_mut(slot).unwrap().1.value = v.clone();
+                cache.set(crate::bytecode::IcState {
+                    depth: 0,
+                    slot: slot as u32,
+                    recv_shape: shape,
+                    holder_shape: shape,
+                });
+                true
+            }
+            None => false, // create / inherited setter — slow path
+        }
+    }
+
+    /// Whether object `ptr` reads/writes like an ordinary object — i.e. it is not registered in any
+    /// of the exotic side tables (proxy, module namespace, typed array, deferred namespace). Cheap:
+    /// each empty table is skipped without hashing, which is the common case in a hot loop.
+    #[inline]
+    pub(crate) fn ordinary_get_ptr(&self, ptr: usize) -> bool {
+        (self.proxies.is_empty() || !self.proxies.contains_key(&ptr))
+            && (self.typed_arrays.is_empty() || !self.typed_arrays.contains_key(&ptr))
+            && (self.module_ns.is_empty() || !self.module_ns.contains_key(&ptr))
+            && (self.deferred_ns.is_empty() || !self.deferred_ns.contains_key(&ptr))
     }
 
     /// [[Get]](P, Receiver): like [`get_member`] but with an explicit `receiver` — the `this` a
@@ -2472,36 +2932,32 @@ impl Interp {
             let new_len = n as usize;
             let old_len = self.array_length(obj);
             if new_len < old_len {
-                // Delete out-of-range indices from the top down, stopping at a non-configurable one
-                // (ArraySetLength). Collect + sort descending so the scan is O(n log n), never O(n²).
-                let mut indices: Vec<usize> = obj
+                // ArraySetLength deletes out-of-range indices from the top down, stopping at a
+                // non-configurable one. Equivalent bulk form: everything above the *highest*
+                // non-configurable out-of-range index (all necessarily configurable) is removed
+                // in one O(n) compaction; length settles just past the blocker (strict throws).
+                let blocker: Option<usize> = obj
                     .borrow()
                     .props
-                    .keys()
                     .iter()
-                    .filter_map(|k| {
+                    .filter(|(_, p)| !p.configurable)
+                    .filter_map(|(k, _)| {
                         // Only array-index keys (canonical, < 2^32-1) participate in truncation;
                         // "4294967296" and friends are ordinary properties.
                         crate::value::canonical_index(k).map(|n| n as usize)
                     })
                     .filter(|&idx| idx >= new_len)
-                    .collect();
-                indices.sort_unstable_by(|a, b| b.cmp(a));
-                for idx in indices {
-                    let configurable = obj
-                        .borrow()
-                        .props
-                        .get(&idx.to_string())
-                        .map(|p| p.configurable)
-                        .unwrap_or(true);
-                    if configurable {
-                        obj.borrow_mut().props.remove(&idx.to_string());
-                    } else {
-                        // length settles just past the blocking element; a strict assignment throws.
-                        obj.borrow_mut().props.insert(
+                    .max();
+                match blocker {
+                    None => obj.borrow_mut().props.remove_indices_from(new_len),
+                    Some(b) => {
+                        let mut ob = obj.borrow_mut();
+                        ob.props.remove_indices_from(b + 1);
+                        ob.props.insert(
                             "length",
-                            Property::data(Value::Num((idx + 1) as f64), true, false, false),
+                            Property::data(Value::Num((b + 1) as f64), true, false, false),
                         );
+                        drop(ob);
                         if self.strict {
                             return Err(self.throw(
                                 "TypeError",
@@ -2692,6 +3148,27 @@ impl Interp {
         self.gc_pins.insert(Rc::as_ptr(o) as usize, o.clone());
     }
 
+    /// A regex-ready view of `s`, cached by string identity: repeated exec/replace/split over the
+    /// same subject (the common shape of both real code and the regexp benchmarks) skips the
+    /// O(len) element-vector rebuild. Strings are immutable, and each entry holds its `Rc` so the
+    /// pointer can't be reused by a new allocation while cached.
+    pub(crate) fn re_text(&mut self, unicode: bool, s: &Rc<str>) -> Rc<crate::regex::ReText> {
+        let key = s.as_ptr();
+        if let Some((_, _, t)) = self
+            .re_texts
+            .iter()
+            .find(|(k, u, _)| k.as_ptr() == key && *u == unicode)
+        {
+            return t.clone();
+        }
+        let t = Rc::new(crate::regex::ReText::new_rc(unicode, s));
+        if self.re_texts.len() >= 4 {
+            self.re_texts.remove(0);
+        }
+        self.re_texts.push((s.clone(), unicode, t.clone()));
+        t
+    }
+
     /// The object references *to other heap objects* held directly by `o` (proto, property
     /// values/getters/setters, and bound-function target/this/args). Collected into a Vec so `o`'s
     /// borrow is released before callers re-borrow — important for self-referential objects.
@@ -2753,7 +3230,7 @@ impl Interp {
         // Scopes are graph nodes too: a closure's captured environment references objects (its
         // bindings) and vice versa (`Callable::User`), so cycles routinely pass through them.
         let scopes = scope_snapshot();
-        let sidx: HashMap<usize, usize> = scopes
+        let sidx: crate::fasthash::FastMap<usize, usize> = scopes
             .iter()
             .enumerate()
             .map(|(k, e)| (Rc::as_ptr(e) as usize, k))
@@ -3115,10 +3592,15 @@ impl Interp {
         }
         let r = match call {
             Callable::None => Err(self.throw("TypeError", "value is not a function")),
-            Callable::Native(f) => f(self, this, args).map_err(Abrupt::Throw),
+            Callable::Native(_) | Callable::NativeData(_) => {
+                self.dispatch_native(&call, this, args).map_err(Abrupt::Throw)
+            }
             Callable::User(func, env) => {
-                // A class constructor cannot be [[Call]]ed.
-                if self.class_info.contains_key(&(Rc::as_ptr(&obj) as usize)) {
+                // A class constructor cannot be [[Call]]ed. (Empty-map guard: this runs on every
+                // single call, and most programs define no classes.)
+                if !self.class_info.is_empty()
+                    && self.class_info.contains_key(&(Rc::as_ptr(&obj) as usize))
+                {
                     return Err(self.throw(
                         "TypeError",
                         "Class constructor cannot be invoked without 'new'",
@@ -3152,7 +3634,7 @@ impl Interp {
                                 Callable::User(..) => "user",
                                 Callable::WrappedShadow { .. } => "wshadow",
                                 Callable::WrappedCross { .. } => "wcross",
-                                Callable::Native(_) => "native",
+                                Callable::Native(_) | Callable::NativeData(_) => "native",
                                 _ => "other",
                             },
                             _ => "nonobj",
@@ -3584,6 +4066,104 @@ impl Interp {
         is_construct: bool,
         fn_obj: &Gc,
     ) -> Result<Value, Abrupt> {
+        // Bytecode fast call: an eligible sync callee with a compiled chunk runs on the VM with no
+        // activation environment at all. Sound because a compiled body has no closures,
+        // `arguments`, direct eval, `with`, `super`, or `new.target` (`bytecode::compile` refuses
+        // them all): nothing can observe the activation, so free names resolve through the
+        // definition env exactly as they would through an empty activation parented there.
+        // Constructs qualify too when the callee is a *plain* function (no `class_info`): the
+        // fresh `this` came in from `construct_nt`, which also maps a non-object return back to
+        // it — and a VM body cannot rebind `this`, so the slow path's scope walk-back would find
+        // the same value. Class constructors (field initializers, derived-`this` TDZ) and
+        // generators/async stay on the tree-walker. For plain calls `call_dispatch` already
+        // saved/cleared `new_target`/`constructing`. One divergence: no `lazy` args stash, so
+        // legacy `f.arguments` reflection during an active VM frame reads null (the VM's
+        // slot-based locals never aliased it faithfully anyway).
+        if !matches!(self.tier, crate::bytecode::Tier::Interp)
+            && !func.is_generator
+            && !func.is_async
+            && (!is_construct || !self.class_info.contains_key(&(Rc::as_ptr(fn_obj) as usize)))
+        {
+            if func.code.get().is_none() {
+                let n = func.calls.get().saturating_add(1);
+                func.calls.set(n);
+                if n > self.tier_threshold {
+                    let compiled = crate::bytecode::compile(func);
+                    if compiled.is_none() && std::env::var_os("LUMEN_TIER_LOG").is_some() {
+                        let src = func.source.as_deref().unwrap_or("<no source>");
+                        let head: String = src.chars().take(70).collect();
+                        eprintln!("[tier] bail: {}", head.replace('\n', " "));
+                    }
+                    let _ = func.code.set(compiled);
+                }
+            }
+            if let Some(Some(chunk)) = func.code.get() {
+                let chunk = chunk.clone();
+                // OrdinaryCallBindThis, computed only when the body reads `this`. A construct's
+                // `this` is the fresh instance — bound directly, never coerced.
+                let this_val = if chunk.uses_this() {
+                    if func.is_strict || is_construct {
+                        this
+                    } else {
+                        match this {
+                            Value::Undefined | Value::Null => Value::Obj(self.global.clone()),
+                            other @ Value::Obj(_) => other,
+                            prim => crate::builtins::box_primitive_pub(self, prim),
+                        }
+                    }
+                } else {
+                    Value::Undefined
+                };
+                let saved_strict = std::mem::replace(&mut self.strict, func.is_strict);
+                let saved_tco = std::mem::replace(
+                    &mut self.tco_ok,
+                    func.is_strict && !is_construct,
+                );
+                let saved_field_init = self.in_field_init_code;
+                let saved_agb = self.in_async_gen_body;
+                // A construct consumes the pending new.target exactly like the slow path, so a
+                // stale value can never be observed later; restored below with the rest.
+                let saved_new_target = if is_construct {
+                    Some(std::mem::replace(
+                        &mut self.new_target,
+                        std::mem::replace(&mut self.pending_new_target, Value::Undefined),
+                    ))
+                } else {
+                    None
+                };
+                if !func.is_arrow {
+                    self.in_field_init_code = false;
+                    self.in_async_gen_body = false;
+                }
+                // Machine-code tier: compile once (None = unsupported — async or platform),
+                // then run the JIT body; otherwise the bytecode VM.
+                let mut jit_code = None;
+                if matches!(self.tier, crate::bytecode::Tier::Jit) {
+                    if chunk.jit.get().is_none() {
+                        let layout = *self
+                            .jit_layout
+                            .get_or_init(|| crate::value::jit_layout(&self.object_proto));
+                        let _ =
+                            chunk.jit.set(crate::jit::compile(&chunk, &layout).map(std::rc::Rc::new));
+                    }
+                    if let Some(Some(code)) = chunk.jit.get() {
+                        jit_code = Some(code.clone());
+                    }
+                }
+                let r = match jit_code {
+                    Some(code) => crate::jit::run(self, &chunk, &code, &closure, this_val, args),
+                    None => crate::bytecode::run(self, &chunk, &closure, this_val, args),
+                };
+                self.strict = saved_strict;
+                self.tco_ok = saved_tco;
+                self.in_field_init_code = saved_field_init;
+                self.in_async_gen_body = saved_agb;
+                if let Some(nt) = saved_new_target {
+                    self.new_target = nt;
+                }
+                return r;
+            }
+        }
         // A function with parameter expressions (default values or destructuring with defaults) gets
         // a separate parameter Environment Record — not a variable environment — so its body's `var`
         // hoisting sits in a distinct scope below it (and a direct `eval` in a parameter default
@@ -3768,7 +4348,7 @@ impl Interp {
                 self.reject_promise(&promise, reason);
                 return Ok(promise);
             }
-            let r = self.run_async(func, &body, param_seed);
+            let r = self.run_async(func, &body, param_seed, args);
             self.strict = saved_strict;
             self.new_target = saved_new_target;
             self.in_field_init_code = saved_field_init;
@@ -3824,37 +4404,19 @@ impl Interp {
             &mut self.tco_ok,
             func.is_strict && !func.is_generator && !func.is_async && !is_construct,
         );
-        // Bytecode tier: an eligible function (compiled whole; see crate::bytecode) runs in the
-        // VM instead of the statement walk. The activation env stays the root for free-name
-        // resolution; locals live in VM slots. Never taken in the default `interp` tier.
-        let mut vm_chunk = None;
-        if matches!(self.tier, crate::bytecode::Tier::Bytecode) && !is_construct {
-            if func.code.get().is_none() {
-                let n = func.calls.get().saturating_add(1);
-                func.calls.set(n);
-                if n > self.tier_threshold {
-                    let _ = func.code.set(crate::bytecode::compile(func));
-                }
-            }
-            if let Some(Some(chunk)) = func.code.get() {
-                vm_chunk = Some(chunk.clone());
-            }
-        }
+        // (The bytecode tier intercepted eligible calls at the top of this function; anything
+        // reaching here — construct calls, uncompilable bodies — runs on the tree-walker.)
         let mut result = Ok(Value::Undefined);
-        if let Some(chunk) = vm_chunk {
-            result = crate::bytecode::run(self, &chunk, &body, args);
-        } else {
-            for stmt in &func.body {
-                match self.exec_stmt(stmt, &body) {
-                    Ok(_) => {}
-                    Err(Abrupt::Return(v)) => {
-                        result = Ok(v);
-                        break;
-                    }
-                    Err(e) => {
-                        result = Err(e);
-                        break;
-                    }
+        for stmt in &func.body {
+            match self.exec_stmt(stmt, &body) {
+                Ok(_) => {}
+                Err(Abrupt::Return(v)) => {
+                    result = Ok(v);
+                    break;
+                }
+                Err(e) => {
+                    result = Err(e);
+                    break;
                 }
             }
         }
@@ -3929,6 +4491,11 @@ impl Interp {
         let body: Box<dyn FnOnce(&mut Interp) -> crate::coroutine::Suspend> = Box::new(move |i| {
             let saved_strict = i.strict;
             i.strict = func.is_strict;
+            // A coroutine body runs outside `Interp::call`'s tail-call trampoline, so its top-level
+            // `return f(...)` are never proper tail calls; force `tco_ok` off before each statement
+            // (it can leak back to `true` across a `yield`/`await` resume) so a return here can't be
+            // parked as a pending tail call that nothing runs. See the note in `run_async`.
+            let saved_tco = std::mem::replace(&mut i.tco_ok, false);
             let mut pn = param_bound_names(&func.params);
             if !func.is_arrow {
                 pn.push("arguments".to_string());
@@ -3946,6 +4513,7 @@ impl Interp {
             }
             let mut result: Result<Value, Abrupt> = Ok(Value::Undefined);
             for stmt in &func.body {
+                i.tco_ok = false;
                 match i.exec_stmt(stmt, &scope) {
                     Ok(_) => {}
                     Err(e) => {
@@ -3966,6 +4534,7 @@ impl Interp {
             };
             i.in_async_gen_body = saved_agb;
             i.strict = saved_strict;
+            i.tco_ok = saved_tco;
             outcome
         });
         let ptr = self as *mut Interp;
@@ -3991,17 +4560,89 @@ impl Interp {
     /// Start an async function: spawn its coroutine, return a promise that settles when the body
     /// finishes. Each `await` parks the coroutine; a microtask resumes it once the awaited value
     /// settles.
+    /// The compiled chunk for an async function if it should run on the bytecode VM: the bytecode
+    /// tier is on and the body has been called past the tier threshold and fits the VM subset.
+    /// Mirrors the sync-call tiering in `call_inner`.
+    fn async_vm_chunk(&self, func: &Rc<Function>) -> Option<Rc<crate::bytecode::Chunk>> {
+        if matches!(self.tier, crate::bytecode::Tier::Interp) {
+            return None;
+        }
+        if func.code.get().is_none() {
+            let n = func.calls.get().saturating_add(1);
+            func.calls.set(n);
+            if n > self.tier_threshold {
+                let _ = func.code.set(crate::bytecode::compile(func));
+            }
+        }
+        match func.code.get() {
+            Some(Some(chunk)) => Some(chunk.clone()),
+            _ => None,
+        }
+    }
+
     fn run_async(
         &mut self,
         func: &Rc<Function>,
         scope: &Env,
         param_seed: Option<Env>,
+        args: &[Value],
     ) -> Result<Value, Abrupt> {
+        // Fast path: an async body that compiles runs on the bytecode VM, suspending at each `await`
+        // without an OS-thread coroutine (see `bytecode::VmCoro`). Params seed straight into slots
+        // from `args`; the activation scope is only the root for free-name resolution.
+        let coro = if let Some(chunk) = self.async_vm_chunk(func) {
+            let this_val = if chunk.uses_this() {
+                self.get_var("this", scope)?
+            } else {
+                Value::Undefined
+            };
+            crate::coroutine::Coroutine::Vm(crate::bytecode::VmCoro::new(
+                self,
+                chunk,
+                scope.clone(),
+                this_val,
+                args,
+            ))
+        } else {
+            self.spawn_async_thread(func, scope, param_seed)?
+        };
+        let promise = self.new_promise();
+        if let Value::Obj(o) = &promise {
+            self.gc_pin(o);
+            self.generators.insert(Rc::as_ptr(o) as usize, coro);
+        }
+        let key = match &promise {
+            Value::Obj(o) => Rc::as_ptr(o) as usize,
+            _ => unreachable!(),
+        };
+        self.drive_async(
+            key,
+            promise.clone(),
+            crate::coroutine::Resume::Next(Value::Undefined),
+        );
+        Ok(promise)
+    }
+
+    /// The tree-walker fallback for an async body that did not compile: run it on a pooled OS-thread
+    /// coroutine.
+    fn spawn_async_thread(
+        &mut self,
+        func: &Rc<Function>,
+        scope: &Env,
+        param_seed: Option<Env>,
+    ) -> Result<crate::coroutine::Coroutine, Abrupt> {
         let func = func.clone();
         let scope = scope.clone();
         let body: Box<dyn FnOnce(&mut Interp) -> crate::coroutine::Suspend> = Box::new(move |i| {
             let saved_strict = i.strict;
             i.strict = func.is_strict;
+            // A coroutine body runs outside `Interp::call`'s tail-call trampoline, so none of its
+            // top-level `return f(...)` are proper tail calls: parking one as a pending tail call
+            // would leave nothing to run it and resolve the body to `undefined`. `tco_ok` can leak
+            // back to `true` across an `await`/resume (it is ambient interpreter state), so force it
+            // off before *each* statement rather than just once — a `return` reads `tco_ok` at its
+            // very start, so this makes the body's own returns take the ordinary path.
+            let saved_tco = std::mem::replace(&mut i.tco_ok, false);
             let mut pn = param_bound_names(&func.params);
             if !func.is_arrow {
                 pn.push("arguments".to_string());
@@ -4017,6 +4658,7 @@ impl Interp {
             }
             let mut result: Result<Value, Abrupt> = Ok(Value::Undefined);
             for stmt in &func.body {
+                i.tco_ok = false;
                 match i.exec_stmt(stmt, &scope) {
                     Ok(_) => {}
                     Err(e) => {
@@ -4036,32 +4678,16 @@ impl Interp {
                 Err(_) => crate::coroutine::Suspend::Done(Value::Undefined),
             };
             i.strict = saved_strict;
+            i.tco_ok = saved_tco;
             outcome
         });
         let ptr = self as *mut Interp;
-        let coro = match crate::coroutine::spawn_coroutine(ptr, crate::coroutine::SendBody(body)) {
-            Ok(c) => c,
-            Err(_) => {
-                return Err(Abrupt::Throw(
-                    self.make_error("Error", crate::coroutine::UNSUPPORTED_MSG),
-                ))
-            }
-        };
-        let promise = self.new_promise();
-        if let Value::Obj(o) = &promise {
-            self.gc_pin(o);
-            self.generators.insert(Rc::as_ptr(o) as usize, coro);
+        match crate::coroutine::spawn_coroutine(ptr, crate::coroutine::SendBody(body)) {
+            Ok(c) => Ok(c),
+            Err(_) => Err(Abrupt::Throw(
+                self.make_error("Error", crate::coroutine::UNSUPPORTED_MSG),
+            )),
         }
-        let key = match &promise {
-            Value::Obj(o) => Rc::as_ptr(o) as usize,
-            _ => unreachable!(),
-        };
-        self.drive_async(
-            key,
-            promise.clone(),
-            crate::coroutine::Resume::Next(Value::Undefined),
-        );
-        Ok(promise)
     }
 
     /// Resume an async coroutine and react to how it parks: an `await` (Yield) attaches a microtask
@@ -4150,7 +4776,7 @@ impl Interp {
                 return;
             }
         };
-        if coro.done {
+        if coro.done() {
             self.generators.insert(key, coro);
             match signal {
                 Resume::Throw(e) => {
@@ -4170,7 +4796,7 @@ impl Interp {
         }
         // suspendedStart: a return() before the first next() awaits its value without ever
         // running the body.
-        if !coro.started {
+        if !coro.started() {
             if let Resume::Return(v) = signal {
                 self.generators.insert(key, coro);
                 return self.async_gen_await_return(key, r, v);
@@ -4480,7 +5106,7 @@ impl Interp {
         }
         let call = obj.borrow().call.clone();
         match call {
-            Callable::Native(f) => {
+            Callable::Native(_) | Callable::NativeData(_) => {
                 // A native non-constructor (a method, global function, Math fn) has no own
                 // `prototype` property; only real built-in constructors do. Reject `new` on the rest.
                 let constructable =
@@ -4497,7 +5123,7 @@ impl Interp {
                 let saved_nt = self.new_target.clone();
                 self.constructing = true;
                 self.new_target = new_target;
-                let r = f(self, Value::Undefined, args).map_err(Abrupt::Throw);
+                let r = self.dispatch_native(&call, Value::Undefined, args).map_err(Abrupt::Throw);
                 self.constructing = saved;
                 self.new_target = saved_nt;
                 r
@@ -4981,6 +5607,15 @@ fn collect_hoist_stmt(stmt: &Stmt, out: &mut Vec<HoistOp>) {
             collect_hoist_stmt(body, out);
         }
         Stmt::ForInOf { body, .. } => collect_hoist_stmt(body, out),
+        // A switch is a single block scope, but `var`s in its case bodies still hoist to the
+        // enclosing function/script (only lexical bindings are switch-block-scoped).
+        Stmt::Switch { cases, .. } => {
+            for case in cases {
+                for s in &case.body {
+                    collect_hoist_stmt(s, out);
+                }
+            }
+        }
         Stmt::Try {
             block,
             handler,

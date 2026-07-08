@@ -13,23 +13,33 @@ pub type Gc = Rc<RefCell<Object>>;
 /// so a plain `Result<Value, Value>` (Err = the thrown value) is the whole contract.
 pub type NativeFn = fn(&mut Interp, Value, &[Value]) -> Result<Value, Value>;
 
+/// A native function that carries captured state, unlike the bare-`fn` [`NativeFn`]. The embedder
+/// uses this to wrap host callbacks that need associated data a function pointer can't hold — e.g.
+/// an N-API C callback together with its `void*` and module handle.
+pub type NativeClosure = dyn Fn(&mut Interp, Value, &[Value]) -> Result<Value, Value>;
+
+/// The engine value. `repr(u8)` with fixed discriminants gives it a *defined* layout — tag byte
+/// at offset 0, payload at offset 8 — which the JIT's inline fast paths read directly (see
+/// `jit::layout` for the compile-time assertions). Tags 0..=4 are the trivially-copyable
+/// variants (no refcount): the JIT may memcpy exactly those.
 #[derive(Clone, Default)]
+#[repr(u8)]
 pub enum Value {
     #[default]
-    Undefined,
+    Undefined = 0,
     /// The spec's EMPTY completion marker: produced only by *statement* evaluation (declarations
     /// and other value-less statements) so completion values thread per UpdateEmpty. Never a JS
     /// value — every engine boundary converts it to `Undefined` before a value escapes.
-    Empty,
-    Null,
-    Bool(bool),
-    Num(f64),
+    Empty = 1,
+    Null = 2,
+    Bool(bool) = 3,
+    Num(f64) = 4,
     /// BigInt, approximated with `i128` (exact within ±2^127; tests beyond that range fail rather
     /// than implementing arbitrary precision).
-    BigInt(crate::bigint::JsBigInt),
-    Str(Rc<str>),
-    Sym(Rc<SymbolData>),
-    Obj(Gc),
+    BigInt(crate::bigint::JsBigInt) = 5,
+    Str(Rc<str>) = 6,
+    Sym(Rc<SymbolData>) = 7,
+    Obj(Gc) = 8,
 }
 
 /// A unique Symbol. Identity is the `id` (every `Symbol()` call gets a fresh one); `description` is
@@ -39,6 +49,83 @@ pub struct SymbolData {
     pub description: Option<Rc<str>>,
 }
 
+/// Byte offsets the JIT's inline property-cache templates read directly out of the object graph.
+/// Every field is *measured at runtime* against the real types (never hardcoded), and the layout
+/// assumptions that std does not guarantee — `Vec`'s data pointer at offset 0, `Rc`'s strong
+/// count 16 bytes before its data — are probed and reported in `valid`. If `valid` is false the
+/// JIT emits no inline caches and everything routes through the checked helper, so a future
+/// libstd layout change degrades performance, never correctness.
+#[derive(Clone, Copy)]
+pub struct JitLayout {
+    /// `Object` within `RefCell<Object>` (i.e. `Rc::as_ptr` → `&Object`).
+    pub refcell_value: usize,
+    pub obj_proto: usize,
+    pub obj_props: usize,
+    pub obj_exotic: usize,
+    pub props_shape: usize,
+    /// The `entries` `Vec` within `Props` (its data pointer is the Vec's first word when `valid`).
+    pub props_entries: usize,
+    /// `size_of::<(Rc<str>, Property)>()` — the entry stride.
+    pub entry_size: usize,
+    /// `Value` within an entry `(Rc<str>, Property)`.
+    pub entry_value: usize,
+    /// `accessor` bool within an entry.
+    pub entry_accessor: usize,
+    /// Bytes from an `Rc<T>`'s data pointer back to its strong count.
+    pub rc_strong_back: usize,
+    /// `Exotic::None`'s discriminant byte (the inline path requires an ordinary object).
+    pub exotic_none_tag: u8,
+    pub valid: bool,
+}
+
+/// Measure [`JitLayout`] against the live types, probing the non-guaranteed std layouts.
+pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
+    use std::mem::offset_of;
+    let refcell_base = Rc::as_ptr(sample) as usize;
+    let obj_addr = &*sample.borrow() as *const Object as usize;
+    let refcell_value = obj_addr - refcell_base;
+
+    // Vec data pointer at offset 0?
+    let mut v: Vec<(Rc<str>, Property)> = Vec::with_capacity(1);
+    v.push((Rc::from("p"), Property::plain(Value::Num(0.0))));
+    let vec_first_word = unsafe { *(&v as *const Vec<_> as *const usize) };
+    let vec_ptr_ok = vec_first_word == v.as_ptr() as usize;
+
+    // Rc strong count 16 bytes before the data pointer?
+    let r = Rc::new(0u64);
+    let vp = Rc::as_ptr(&r) as usize;
+    let rc_strong_back = 16usize;
+    let strong_ok = unsafe { *((vp - rc_strong_back) as *const usize) } == 1;
+
+    // Exotic::None discriminant (Exotic is repr(Rust) but a plain C-like leading unit variant is
+    // discriminant 0; probe to be certain).
+    let none = Exotic::None;
+    let exotic_none_tag = unsafe { *(&none as *const Exotic as *const u8) };
+
+    // `Option<Gc>` (the `proto` field) null-pointer niche: Some stores `Rc::as_ptr`, None is 0 —
+    // so the GetMethod inline can read the proto as one word and null-check it.
+    let some_proto: Option<Gc> = Some(sample.clone());
+    let some_word = unsafe { *(&some_proto as *const Option<Gc> as *const usize) };
+    let none_proto: Option<Gc> = None;
+    let none_word = unsafe { *(&none_proto as *const Option<Gc> as *const usize) };
+    let proto_niche_ok = some_word == Rc::as_ptr(sample) as usize && none_word == 0;
+
+    JitLayout {
+        refcell_value,
+        obj_proto: offset_of!(Object, proto),
+        obj_props: offset_of!(Object, props),
+        obj_exotic: offset_of!(Object, exotic),
+        props_shape: offset_of!(Props, shape),
+        props_entries: offset_of!(Props, entries),
+        entry_size: std::mem::size_of::<(Rc<str>, Property)>(),
+        entry_value: offset_of!((Rc<str>, Property), 1) + offset_of!(Property, value),
+        entry_accessor: offset_of!((Rc<str>, Property), 1) + offset_of!(Property, accessor),
+        rc_strong_back,
+        exotic_none_tag,
+        valid: vec_ptr_ok && strong_ok && proto_niche_ok,
+    }
+}
+
 impl Value {
     pub fn str(s: impl Into<Rc<str>>) -> Value {
         Value::Str(s.into())
@@ -46,9 +133,28 @@ impl Value {
     pub fn from_string(s: String) -> Value {
         Value::Str(Rc::from(s.as_str()))
     }
+    /// A BigInt from an `i64` (for the embedder's 64-bit integer bridge, e.g. wasm i64).
+    pub fn bigint_from_i64(v: i64) -> Value {
+        Value::BigInt(crate::bigint::JsBigInt::from(v))
+    }
+    /// Read a BigInt as an `i64` (wrapping past ±2^63), for the embedder's 64-bit bridge. `None`
+    /// when the value isn't a BigInt.
+    pub fn bigint_as_i64(&self) -> Option<i64> {
+        match self {
+            Value::BigInt(b) => Some(b.to_i128_wrapping() as i64),
+            _ => None,
+        }
+    }
     pub fn as_obj(&self) -> Option<&Gc> {
         match self {
             Value::Obj(o) => Some(o),
+            _ => None,
+        }
+    }
+    /// The number, if this is a `Number` (an embedder convenience for reading op arguments).
+    pub fn as_num_opt(&self) -> Option<f64> {
+        match self {
+            Value::Num(n) => Some(*n),
             _ => None,
         }
     }
@@ -80,6 +186,8 @@ impl Value {
 pub enum Callable {
     None,
     Native(NativeFn),
+    /// A native function carrying captured state (see [`NativeClosure`]).
+    NativeData(std::rc::Rc<NativeClosure>),
     /// An interpreted function: its AST plus the lexical environment it closed over.
     User(Rc<Function>, Env),
     /// The result of `Function.prototype.bind`.
@@ -127,9 +235,12 @@ pub enum Exotic {
     StrWrap(Rc<str>),
     SymWrap(Rc<SymbolData>),
     BigIntWrap(crate::bigint::JsBigInt),
-    /// An error object — carries no extra data (name/message live as ordinary properties) but the
-    /// tag lets `Error.prototype.toString` and the test262 runner recognise it cheaply.
-    Error,
+    /// An error object. Carries the captured call-stack frames as a preformatted string (the
+    /// `\n    at <fn>` lines, empty when thrown at top level), snapshotted at construction; the
+    /// `Error.prototype.stack` getter prepends the live `name: message` head. name/message live as
+    /// ordinary properties, and the tag lets `Error.prototype.toString` / the test262 runner
+    /// recognise an error cheaply.
+    Error(Rc<str>),
     /// An `arguments` exotic object (mapped index/parameter aliasing lives in
     /// `Interp::mapped_arguments`).
     Arguments,
@@ -383,6 +494,13 @@ impl Property {
 pub struct Props {
     entries: Vec<(Rc<str>, Property)>,
     index: crate::fasthash::FastMap<Rc<str>, usize>,
+    /// Object shape (hidden class): the id encoding this map's ordered key sequence (see
+    /// [`ShapeTable`]). Two `Props` share an id exactly when they added the same keys in the same
+    /// order, so an inline cache that recorded (shape, slot) from one object can trust that slot
+    /// on any other object of the same shape — without a key compare. Bumped to a child on
+    /// new-key insert, to a fresh unique on a structural removal. Only consulted for non-exotic
+    /// objects (arrays keep the key-compare path — same shape can mean different element counts).
+    shape: u32,
     /// Dense element map: `elems[n]` is the `entries` slot of canonical-index key `n`, or
     /// `NO_SLOT`. Maintained for a (near-)contiguous prefix from 0 — a canonical key far past the
     /// dense frontier lives only in `index` (see `note_inserted`). This is what makes `a[i]`
@@ -392,6 +510,90 @@ pub struct Props {
 
 /// `elems` hole marker (also caps how many entries dense slots can address).
 const NO_SLOT: u32 = u32::MAX;
+
+/// The empty-object shape: every `Props` starts here and all empty objects share it, so adding
+/// the same first key to two of them lands on the same child shape.
+const SHAPE_EMPTY: u32 = 0;
+
+/// The object-shape (hidden-class) transition tree. A shape id encodes an *ordered sequence of
+/// property keys* — two `Props` share an id exactly when they added the same keys in the same
+/// order (attributes are NOT encoded; the inline cache re-checks accessor/writable at the slot).
+/// `transitions[(parent, key)] = child` is memoized, so structurally-identical objects converge
+/// on one id — which is what makes a shared per-site cache's shape compare meaningful (the flaw
+/// that sank the earlier per-object version counter). A structural *removal* can't be a tree
+/// transition (it doesn't extend the key sequence), so it mints a fresh unique id that no cache
+/// ever holds — forcing a re-derive.
+struct ShapeTable {
+    transitions: crate::fasthash::FastMap<(u32, Rc<str>), u32>,
+    next: u32,
+}
+
+thread_local! {
+    static SHAPES: RefCell<ShapeTable> = RefCell::new(ShapeTable {
+        transitions: Default::default(),
+        next: 1, // 0 is SHAPE_EMPTY
+    });
+}
+
+impl ShapeTable {
+    fn fresh(&mut self) -> u32 {
+        let id = self.next;
+        // Wrap past 0 (SHAPE_EMPTY must stay the empty object's id alone).
+        self.next = self.next.checked_add(1).filter(|&n| n != 0).unwrap_or(1);
+        id
+    }
+}
+
+/// The child shape reached by adding `key` to shape `parent` (memoized so it is shared).
+fn shape_transition(parent: u32, key: &Rc<str>) -> u32 {
+    SHAPES.with(|t| {
+        let mut t = t.borrow_mut();
+        if let Some(&c) = t.transitions.get(&(parent, key.clone())) {
+            return c;
+        }
+        let child = t.fresh();
+        t.transitions.insert((parent, key.clone()), child);
+        child
+    })
+}
+
+/// A fresh unique shape id (a structural removal / deopt — no cache should still match).
+fn shape_fresh() -> u32 {
+    SHAPES.with(|t| t.borrow_mut().fresh())
+}
+
+/// Entry count up to which a `Props` runs without a hash index (linear-scan lookups, no hash
+/// allocation or rehash on insert). Most objects — instance fields, cons cells, literals — stay
+/// under it for their whole life.
+const INDEX_THRESHOLD: usize = 8;
+
+thread_local! {
+    /// Interned key strings for small array indices — every dense array element key "0".."63"
+    /// shares one allocation per thread instead of allocating per element.
+    static INDEX_KEYS: Vec<Rc<str>> = (0..64).map(|i| Rc::from(i.to_string().as_str())).collect();
+    /// Interned keys for the properties every function object carries — closure creation in a
+    /// hot loop would otherwise allocate each key string per closure.
+    static FN_KEYS: [Rc<str>; 4] = [
+        Rc::from("length"),
+        Rc::from("name"),
+        Rc::from("prototype"),
+        Rc::from("constructor"),
+    ];
+}
+
+/// The property key for array index `n`, interned for small `n`.
+pub(crate) fn index_key(n: usize) -> Rc<str> {
+    if n < 64 {
+        INDEX_KEYS.with(|k| k[n].clone())
+    } else {
+        Rc::from(n.to_string().as_str())
+    }
+}
+
+/// Interned `"length"` / `"name"` / `"prototype"` / `"constructor"` keys (see `FN_KEYS`).
+pub(crate) fn fn_key(i: usize) -> Rc<str> {
+    FN_KEYS.with(|k| k[i].clone())
+}
 
 impl Default for Props {
     fn default() -> Self {
@@ -404,8 +606,15 @@ impl Props {
         Props {
             entries: Vec::new(),
             index: Default::default(),
+            shape: SHAPE_EMPTY,
             elems: Vec::new(),
         }
+    }
+
+    /// This map's shape id — the inline cache's structural validation token (see the `shape` field).
+    #[inline]
+    pub(crate) fn shape(&self) -> u32 {
+        self.shape
     }
 
     /// The own property for canonical index `n`, without hashing. `None` only means "not in the
@@ -451,58 +660,143 @@ impl Props {
             }
         }
     }
+    /// The entry slot for `key`. Small maps (≤ [`INDEX_THRESHOLD`] entries — most objects) have
+    /// no hash index at all: lookup is a short linear scan and inserts never hash or rehash.
+    /// The index is built once when a map grows past the threshold and is authoritative from
+    /// then on (an emptied-but-once-large map keeps using it).
+    #[inline]
+    fn find(&self, key: &str) -> Option<usize> {
+        if self.index.is_empty() {
+            return self.entries.iter().position(|(k, _)| &**k == key);
+        }
+        self.index.get(key).copied()
+    }
+    /// Build the hash index for every current entry (crossing the small-map threshold).
+    fn build_index(&mut self) {
+        for (j, (k, _)) in self.entries.iter().enumerate() {
+            self.index.insert(k.clone(), j);
+        }
+    }
     pub(crate) fn get(&self, key: &str) -> Option<&Property> {
-        self.index.get(key).map(|i| &self.entries[*i].1)
+        self.find(key).map(|i| &self.entries[i].1)
     }
     pub(crate) fn get_mut(&mut self, key: &str) -> Option<&mut Property> {
-        if let Some(i) = self.index.get(key) {
-            Some(&mut self.entries[*i].1)
-        } else {
-            None
+        match self.find(key) {
+            Some(i) => Some(&mut self.entries[i].1),
+            None => None,
         }
     }
     pub(crate) fn contains(&self, key: &str) -> bool {
-        self.index.contains_key(key)
+        self.find(key).is_some()
+    }
+    /// The `entries` slot for `key`, or `None`. Backs the bytecode property inline cache: a hit
+    /// records the slot so the next access can skip the lookup (see `Interp::try_ic_get`).
+    #[inline]
+    pub(crate) fn slot_of(&self, key: &str) -> Option<usize> {
+        self.find(key)
+    }
+    /// The (key, property) at `slot`, or `None` if out of range. The caller re-checks the key —
+    /// slots shift on `remove`, so a cached slot is only trusted after the key matches.
+    #[inline]
+    pub(crate) fn entry_at(&self, slot: usize) -> Option<&(Rc<str>, Property)> {
+        self.entries.get(slot)
+    }
+    /// Mutable [`entry_at`], for the property write inline cache.
+    #[inline]
+    pub(crate) fn entry_at_mut(&mut self, slot: usize) -> Option<&mut (Rc<str>, Property)> {
+        self.entries.get_mut(slot)
     }
     /// Drop every property (used by the GC to break a garbage object's reference cycles).
     pub(crate) fn clear(&mut self) {
         self.entries.clear();
         self.index.clear();
         self.elems.clear();
+        self.shape = shape_fresh();
     }
+    /// Append the next dense element while *building a fresh array in order* (element index ==
+    /// entry slot == dense slot): skips the canonical-index parse and, for small indices, the
+    /// key-string allocation. Only valid on a Props whose entries so far are exactly the dense
+    /// elements 0..len.
+    pub(crate) fn push_dense(&mut self, prop: Property) {
+        let slot = self.entries.len();
+        let key = index_key(slot);
+        if !self.index.is_empty() {
+            self.index.insert(key.clone(), slot);
+        } else if slot + 1 > INDEX_THRESHOLD {
+            self.build_index();
+            self.index.insert(key.clone(), slot);
+        }
+        self.entries.push((key, prop));
+        self.elems.push(slot as u32);
+    }
+
     pub(crate) fn insert(&mut self, key: impl Into<Rc<str>>, prop: Property) {
         let key = key.into();
-        if let Some(i) = self.index.get(&key) {
-            self.entries[*i].1 = prop;
+        if let Some(i) = self.find(&key) {
+            self.entries[i].1 = prop;
         } else {
             let slot = self.entries.len();
-            self.index.insert(key.clone(), slot);
+            if !self.index.is_empty() {
+                self.index.insert(key.clone(), slot);
+            } else if slot + 1 > INDEX_THRESHOLD {
+                self.build_index();
+                self.index.insert(key.clone(), slot);
+            }
+            // Extending the key sequence transitions to the (shared, memoized) child shape.
+            self.shape = shape_transition(self.shape, &key);
             self.entries.push((key, prop));
             self.note_inserted(slot);
         }
     }
+    /// Remove every canonical-index key `>= from` in one pass — array truncation
+    /// (`arr.length = n`). Entries compact and the lookup/dense maps rebuild once: O(n) total,
+    /// where the per-key [`Props::remove`] loop it replaces was O(n) *per key*.
+    pub(crate) fn remove_indices_from(&mut self, from: usize) {
+        let keep = |k: &str| match canonical_index(k) {
+            Some(n) => (n as usize) < from,
+            None => true,
+        };
+        if self.entries.iter().all(|(k, _)| keep(k)) {
+            return;
+        }
+        self.entries.retain(|(k, _)| keep(k));
+        self.index.clear();
+        if self.entries.len() > INDEX_THRESHOLD {
+            self.build_index();
+        }
+        self.elems.clear();
+        for slot in 0..self.entries.len() {
+            self.note_inserted(slot);
+        }
+        // A removal shifts slots: it can't be a tree transition, so deopt to a fresh unique id.
+        self.shape = shape_fresh();
+    }
+
     pub(crate) fn remove(&mut self, key: &str) -> bool {
-        if let Some(i) = self.index.remove(key) {
-            self.entries.remove(i);
+        let Some(i) = self.find(key) else {
+            return false;
+        };
+        self.entries.remove(i);
+        self.shape = shape_fresh(); // slots shifted — deopt (see remove_indices_from)
+        if !self.index.is_empty() {
+            self.index.remove(key);
             // Re-index everything after the removed slot.
             for (j, (k, _)) in self.entries.iter().enumerate().skip(i) {
                 self.index.insert(k.clone(), j);
             }
-            // Dense slots shift down past the removed entry; the removed key's own slot holes.
-            for e in self.elems.iter_mut() {
-                if *e == NO_SLOT {
-                    continue;
-                }
-                match (*e as usize).cmp(&i) {
-                    std::cmp::Ordering::Equal => *e = NO_SLOT,
-                    std::cmp::Ordering::Greater => *e -= 1,
-                    std::cmp::Ordering::Less => {}
-                }
-            }
-            true
-        } else {
-            false
         }
+        // Dense slots shift down past the removed entry; the removed key's own slot holes.
+        for e in self.elems.iter_mut() {
+            if *e == NO_SLOT {
+                continue;
+            }
+            match (*e as usize).cmp(&i) {
+                std::cmp::Ordering::Equal => *e = NO_SLOT,
+                std::cmp::Ordering::Greater => *e -= 1,
+                std::cmp::Ordering::Less => {}
+            }
+        }
+        true
     }
     /// Keys in insertion order. Private-name slots (`#x`) are never enumerable/observable, so they
     /// are excluded here (and from [`ordered_keys`]); private access reads them via [`get`] directly.
@@ -640,3 +934,4 @@ pub fn f64_to_f16(value: f64) -> u16 {
     }
     sign | h
 }
+

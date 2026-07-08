@@ -412,6 +412,57 @@ fn web_url_and_search_params() {
 }
 
 #[test]
+fn web_response_status_defaults() {
+    // An explicit `undefined` status/statusText counts as absent (WebIDL) and takes the default,
+    // rather than coercing to `Number(undefined)` → NaN / `String(undefined)` → "undefined". This
+    // is the path Hono's `c.json()` hits (its internal status is left undefined).
+    let (mut rt, out, _err) = test_runtime();
+    eval_ok(
+        &mut rt,
+        r#"
+        console.log(new Response("x").status);
+        console.log(new Response("x", { status: undefined }).status);
+        console.log(new Response("x", { status: 201 }).status);
+        const r = new Response("x", { status: undefined, statusText: undefined });
+        console.log(JSON.stringify(r.statusText), r.ok);
+        "#,
+    );
+    assert_eq!(out.lines(), ["200", "200", "201", "\"\" true"]);
+}
+
+#[test]
+fn web_readable_stream_body() {
+    // `Response`/`Request` expose their buffered body as a `ReadableStream` via `.body`, and the
+    // constructors accept a stream body — so `new Response(res.body, res)` (Hono's `c.header()`
+    // rebuild) round-trips the payload instead of dropping it. Also covers reader reads, async
+    // iteration, a user-authored stream as a body, and `null` for an empty body.
+    let (mut rt, out, _err) = test_runtime();
+    eval_ok(
+        &mut rt,
+        r#"
+        (async () => {
+            const a = new Response('{"x":1}', { headers: { "content-type": "application/json" } });
+            const rebuilt = new Response(a.body, a);            // c.header() rebuild pattern
+            console.log(await rebuilt.text());
+            console.log(new Response("hi").body instanceof ReadableStream, new Response(null).body);
+            const rd = new Response("hello").body.getReader();
+            const c = await rd.read();
+            console.log(new TextDecoder().decode(c.value), (await rd.read()).done);
+            let acc = "";
+            for await (const ch of new Response("abc").body) acc += new TextDecoder().decode(ch);
+            console.log(acc);
+            const us = new ReadableStream({ start(ctrl) { ctrl.enqueue(new TextEncoder().encode("strm")); ctrl.close(); } });
+            console.log(await new Response(us).text());
+        })();
+        "#,
+    );
+    assert_eq!(
+        out.lines(),
+        ["{\"x\":1}", "true null", "hello true", "abc", "strm"]
+    );
+}
+
+#[test]
 fn web_events_and_abort() {
     let (mut rt, out, _err) = test_runtime();
     eval_ok(
@@ -540,6 +591,236 @@ fn web_fetch_roundtrip_over_local_http() {
     );
     server.join().ok();
     assert_eq!(out.lines(), ["200 true yes", "true 42"]);
+}
+
+// ---- WinterTC Minimum Common API conformance ----
+//
+// The tracked score for the WinterTC "Minimum Common API" global surface. `SUPPORTED` are the
+// interfaces implemented today; `NOT_YET` are the remaining ones. The test asserts every SUPPORTED
+// global is present AND every NOT_YET global is absent — so implementing an interface fails the
+// test until its name is moved across, keeping the score honest. Total = the full spec surface.
+const WINTERTC_SUPPORTED: &[&str] = &[
+    "globalThis",
+    "queueMicrotask",
+    "structuredClone",
+    "atob",
+    "btoa",
+    "fetch",
+    "console",
+    "setTimeout",
+    "clearTimeout",
+    "setInterval",
+    "clearInterval",
+    "Event",
+    "EventTarget",
+    "CustomEvent",
+    "DOMException",
+    "AbortController",
+    "AbortSignal",
+    "TextEncoder",
+    "TextDecoder",
+    "URL",
+    "URLSearchParams",
+    "Headers",
+    "Request",
+    "Response",
+    "ReadableStream",
+    "ReadableStreamDefaultReader",
+    "ReadableStreamDefaultController",
+    "crypto",
+    "Crypto",
+    "SubtleCrypto",
+    "performance",
+    "Performance",
+    "navigator",
+    "self",
+    "Blob",
+    "File",
+    "FormData",
+    "WritableStream",
+    "WritableStreamDefaultWriter",
+    "WritableStreamDefaultController",
+    "TransformStream",
+    "TransformStreamDefaultController",
+    "ByteLengthQueuingStrategy",
+    "CountQueuingStrategy",
+    "TextEncoderStream",
+    "TextDecoderStream",
+    "URLPattern",
+    "CompressionStream",
+    "DecompressionStream",
+    "ReadableStreamBYOBReader",
+    "ReadableByteStreamController",
+    "ReadableStreamBYOBRequest",
+    "WebAssembly",
+];
+const WINTERTC_NOT_YET: &[&str] = &[];
+
+#[test]
+fn wintertc_minimum_common_api() {
+    let (mut rt, out, _err) = test_runtime();
+    let all = [WINTERTC_SUPPORTED, WINTERTC_NOT_YET].concat().join(",");
+    eval_ok(
+        &mut rt,
+        &format!(
+            r#"{{
+                const names = "{all}".split(",");
+                const present = names.filter((n) => typeof globalThis[n] !== "undefined");
+                console.log("PRESENT:" + present.join(","));
+            }}"#,
+        ),
+    );
+    let line = out.lines().into_iter().next().unwrap_or_default();
+    let present: std::collections::HashSet<&str> = line
+        .strip_prefix("PRESENT:")
+        .unwrap_or("")
+        .split(',')
+        .collect();
+
+    let missing_supported: Vec<&str> = WINTERTC_SUPPORTED
+        .iter()
+        .copied()
+        .filter(|n| !present.contains(n))
+        .collect();
+    assert!(
+        missing_supported.is_empty(),
+        "WinterTC regression — these SUPPORTED globals went missing: {missing_supported:?}"
+    );
+    let unexpected: Vec<&str> = WINTERTC_NOT_YET
+        .iter()
+        .copied()
+        .filter(|n| present.contains(n))
+        .collect();
+    assert!(
+        unexpected.is_empty(),
+        "WinterTC globals now present but still listed NOT_YET — move them to SUPPORTED: {unexpected:?}"
+    );
+
+    let total = WINTERTC_SUPPORTED.len() + WINTERTC_NOT_YET.len();
+    println!(
+        "WinterTC Minimum Common API: {}/{} globals implemented",
+        WINTERTC_SUPPORTED.len(),
+        total
+    );
+}
+
+#[test]
+fn wintertc_functional_smoke() {
+    // Presence is not correctness: exercise the core interfaces end-to-end.
+    let (mut rt, out, _err) = test_runtime();
+    eval_ok(
+        &mut rt,
+        r#"
+        const ok = [];
+        ok.push(JSON.stringify(structuredClone({a:[1,2]})) === '{"a":[1,2]}');
+        ok.push(new TextDecoder().decode(new TextEncoder().encode("héllo")) === "héllo");
+        ok.push(new URL("http://x/y?a=1").searchParams.get("a") === "1");
+        ok.push(atob(btoa("hi")) === "hi");
+        ok.push(new AbortController().signal.aborted === false);
+        ok.push(/^[0-9a-f-]{36}$/.test(crypto.randomUUID()));
+        ok.push(typeof performance.now() === "number");
+        ok.push(new Headers({a:"1"}).get("a") === "1");
+        console.log(ok.every(Boolean) ? "ALL_OK" : "FAIL:" + ok.join(","));
+        "#,
+    );
+    assert_eq!(out.lines(), ["ALL_OK"]);
+}
+
+// Cold-boot cost breakdown (realm intrinsics + per-extension install), for tracking the
+// startup floor. `#[ignore]`d (timing, not correctness):
+//   cargo test -p lumen-runtime perf_boot_breakdown --release -- --ignored --nocapture
+#[test]
+#[ignore]
+fn perf_boot_breakdown() {
+    use std::time::Instant;
+
+    fn median(mut xs: Vec<f64>) -> f64 {
+        xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        xs[xs.len() / 2]
+    }
+    // Time a closure's median over N runs, in microseconds.
+    fn bench(n: usize, mut f: impl FnMut() -> f64) -> f64 {
+        median((0..n).map(|_| f()).collect())
+    }
+
+    let engine_us = bench(30, || {
+        let t = Instant::now();
+        let _e = lumen_host::Engine::new();
+        t.elapsed().as_secs_f64() * 1e6
+    });
+    println!("Engine::new (realm intrinsics)   {engine_us:8.1} us");
+
+    // Per-extension install (state + ops + js_init parse+eval), in the real order.
+    let names = ["timers", "console", "process", "fs", "web", "node"];
+    let mut totals = vec![Vec::new(); names.len()];
+    for _ in 0..30 {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let pool = ThreadPool::new(4, tx);
+        let mut engine = lumen_host::Engine::new();
+        engine.ctx().op_state().put(pool.handle());
+        engine.ctx().op_state().put(TaskRegistry::default());
+        let exts = [
+            lumen_timers::extension(),
+            console::extension(),
+            process::extension(),
+            lumen_fs::extension(),
+            lumen_web::extension(),
+            lumen_node::extension(),
+        ];
+        for (i, ext) in exts.into_iter().enumerate() {
+            let t = Instant::now();
+            install(&mut engine, std::slice::from_ref(&ext));
+            totals[i].push(t.elapsed().as_secs_f64() * 1e6);
+        }
+    }
+    let mut sum = 0.0;
+    for (i, name) in names.iter().enumerate() {
+        let m = median(std::mem::take(&mut totals[i]));
+        sum += m;
+        println!("install {name:<8}                 {m:8.1} us");
+    }
+    println!("---\nextensions total                 {sum:8.1} us");
+}
+
+#[test]
+fn web_serve_roundtrip_over_loopback() {
+    // A whole HTTP server + client on one loop: Lumen.serve binds, the same runtime fetches
+    // itself through the loopback socket (server accept, client request, and response write all
+    // run concurrently on the threadpool), then shutdown() lets the loop go idle so eval returns.
+    let (mut rt, out, _err) = test_runtime();
+    eval_ok(
+        &mut rt,
+        r#"
+        (async () => {
+            const server = Lumen.serve(async (req) => {
+                const u = new URL(req.url);
+                if (u.pathname === "/json") {
+                    return Response.json({ ok: true, id: u.searchParams.get("id") });
+                }
+                if (req.method === "POST") return new Response("got:" + (await req.text()));
+                return new Response("pong\n", { headers: { "x-cta": "hi" } });
+            }, { hostname: "127.0.0.1", port: 0 });
+
+            const base = `http://127.0.0.1:${server.port}`;
+            const r1 = await fetch(base + "/");
+            console.log(r1.status, r1.headers.get("x-cta"), (await r1.text()).trim());
+
+            const r2 = await fetch(base + "/json?id=42");
+            const j = await r2.json();
+            console.log(r2.status, j.ok, j.id);
+
+            const r3 = await fetch(base + "/echo", { method: "POST", body: "hey" });
+            console.log(r3.status, await r3.text());
+
+            await server.shutdown();
+            console.log("closed");
+        })();
+        "#,
+    );
+    assert_eq!(
+        out.lines(),
+        ["200 hi pong", "200 true 42", "200 got:hey", "closed"]
+    );
 }
 
 // ---- lumen-node (node: compat; the runtime assembles it) ----
@@ -784,6 +1065,63 @@ fn esm_resolves_node_modules_packages() {
     rt.run_module(&root.join("app.mjs").to_string_lossy())
         .expect("runs");
     assert_eq!(out.lines(), ["esm-pkg cjs-pkg"]);
+}
+
+#[test]
+fn esm_prefers_exports_import_over_cjs_main() {
+    // A package shaped like hono: `main` is a CJS build, but `type:module` + the exports `import`
+    // condition point at an ESM build with real named exports. The bare import must resolve the
+    // ESM entry (named `Hono` works), not fall through to `main` (CJS, default-only).
+    use std::fs;
+    let dir = TempDir::new("esm-exports");
+    let root = dir.0.clone();
+    let pkg = root.join("node_modules").join("dual");
+    fs::create_dir_all(pkg.join("dist").join("cjs")).unwrap();
+    fs::write(
+        pkg.join("package.json"),
+        r#"{
+            "name": "dual",
+            "main": "dist/cjs/index.js",
+            "type": "module",
+            "module": "dist/index.js",
+            "exports": { ".": {
+                "import": "./dist/index.js",
+                "require": "./dist/cjs/index.js"
+            } }
+        }"#,
+    )
+    .unwrap();
+    fs::write(
+        pkg.join("dist").join("index.js"),
+        "export class Widget { hi() { return 'esm'; } }\nexport const kind = 'named';",
+    )
+    .unwrap();
+    // If resolution wrongly picked this CJS build, loading it as ESM would fail (`module` is not
+    // defined) or expose no named `Widget`.
+    fs::write(
+        pkg.join("dist").join("cjs").join("index.js"),
+        "module.exports = { Widget: null, kind: 'cjs' };",
+    )
+    .unwrap();
+    // A bare *subpath* import of a `.js` file must inherit the package's `type:module`.
+    fs::write(
+        pkg.join("dist").join("named.js"),
+        "export const sub = 'subpath-esm';",
+    )
+    .unwrap();
+    fs::write(
+        root.join("app.mjs"),
+        r#"
+        import { Widget, kind } from "dual";
+        import { sub } from "dual/dist/named.js";
+        console.log(new Widget().hi(), kind, sub);
+        "#,
+    )
+    .unwrap();
+    let (mut rt, out, _err) = test_runtime();
+    rt.run_module(&root.join("app.mjs").to_string_lossy())
+        .expect("runs");
+    assert_eq!(out.lines(), ["esm named subpath-esm"]);
 }
 
 #[test]

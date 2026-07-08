@@ -638,39 +638,14 @@ impl Interp {
                     Err(e) => Err(crate::interpreter::update_abrupt_empty(e, Value::Undefined)),
                 }
             }
-            Stmt::While { test, body } => self.run_loop(None, env, |me, env| {
-                let t = me.eval(test, env)?;
-                if !me.to_boolean(&t) {
-                    return Ok(LoopStep::Done(Value::Empty));
-                }
-                let bv = me.exec_stmt(body, env)?;
-                Ok(LoopStep::Continue(bv))
-            }),
-            Stmt::DoWhile { body, test } => {
-                let mut first = true;
-                self.run_loop(None, env, |me, env| {
-                    if !first {
-                        let t = me.eval(test, env)?;
-                        if !me.to_boolean(&t) {
-                            return Ok(LoopStep::Done(Value::Empty));
-                        }
-                    }
-                    first = false;
-                    let bv = me.exec_stmt(body, env)?;
-                    let t = me.eval(test, env)?;
-                    if !me.to_boolean(&t) {
-                        Ok(LoopStep::Done(bv))
-                    } else {
-                        Ok(LoopStep::Continue(bv))
-                    }
-                })
-            }
+            Stmt::While { test, body } => self.exec_while(test, body, env, &[]),
+            Stmt::DoWhile { body, test } => self.exec_do_while(body, test, env, &[]),
             Stmt::For {
                 init,
                 test,
                 update,
                 body,
-            } => self.exec_for(init, test, update, body, env, None),
+            } => self.exec_for(init, test, update, body, env, &[]),
             Stmt::ForInOf {
                 decl,
                 left,
@@ -678,7 +653,7 @@ impl Interp {
                 of,
                 is_await,
                 body,
-            } => self.exec_for_in_of(*decl, left, right, *of, *is_await, body, env, None),
+            } => self.exec_for_in_of(*decl, left, right, *of, *is_await, body, env, &[]),
             Stmt::Break(label) => Err(Abrupt::Break(label.clone(), Value::Empty)),
             Stmt::Continue(label) => Err(Abrupt::Continue(label.clone(), Value::Empty)),
             Stmt::Try {
@@ -748,14 +723,22 @@ impl Interp {
     }
 
     fn exec_labeled(&mut self, label: &str, body: &Stmt, env: &Env) -> Completion {
-        // For loops, push the label so labeled break/continue can target them.
-        let result = match body {
+        // Collect a chain of stacked labels (`a: b: loop`): the labelled statement's inner statement
+        // may itself be labelled, and a labelled break/continue can target *any* label in the chain.
+        // All labels are threaded into the loop so it can catch break/continue naming any of them.
+        let mut labels = vec![label];
+        let mut inner = body;
+        while let Stmt::Labeled { label, body } = inner {
+            labels.push(label);
+            inner = body;
+        }
+        let result = match inner {
             Stmt::For {
                 init,
                 test,
                 update,
                 body,
-            } => self.exec_for(init, test, update, body, env, Some(label)),
+            } => self.exec_for(init, test, update, body, env, &labels),
             Stmt::ForInOf {
                 decl,
                 left,
@@ -763,19 +746,60 @@ impl Interp {
                 of,
                 is_await,
                 body,
-            } => self.exec_for_in_of(*decl, left, right, *of, *is_await, body, env, Some(label)),
-            Stmt::While { .. } | Stmt::DoWhile { .. } => self.exec_stmt(body, env),
+            } => self.exec_for_in_of(*decl, left, right, *of, *is_await, body, env, &labels),
+            Stmt::While { test, body } => self.exec_while(test, body, env, &labels),
+            Stmt::DoWhile { body, test } => self.exec_do_while(body, test, env, &labels),
+            // A non-loop labelled statement (e.g. `a: { … break a; }`): the loop helpers can't catch
+            // the break, so it unwinds to the post-match below. Labels also can't be nested here
+            // because the `while let` above already peeled the whole chain.
             other => self.exec_stmt(other, env),
         };
         match result {
-            Err(Abrupt::Break(Some(l), bv)) if l == label => Ok(bv),
+            Err(Abrupt::Break(Some(l), bv)) if labels.contains(&l.as_str()) => Ok(bv),
             other => other,
         }
     }
 
+    fn exec_while(&mut self, test: &Expr, body: &Stmt, env: &Env, labels: &[&str]) -> Completion {
+        self.run_loop(labels, env, |me, env| {
+            let t = me.eval(test, env)?;
+            if !me.to_boolean(&t) {
+                return Ok(LoopStep::Done(Value::Empty));
+            }
+            let bv = me.exec_stmt(body, env)?;
+            Ok(LoopStep::Continue(bv))
+        })
+    }
+
+    fn exec_do_while(
+        &mut self,
+        body: &Stmt,
+        test: &Expr,
+        env: &Env,
+        labels: &[&str],
+    ) -> Completion {
+        let mut first = true;
+        self.run_loop(labels, env, |me, env| {
+            if !first {
+                let t = me.eval(test, env)?;
+                if !me.to_boolean(&t) {
+                    return Ok(LoopStep::Done(Value::Empty));
+                }
+            }
+            first = false;
+            let bv = me.exec_stmt(body, env)?;
+            let t = me.eval(test, env)?;
+            if !me.to_boolean(&t) {
+                Ok(LoopStep::Done(bv))
+            } else {
+                Ok(LoopStep::Continue(bv))
+            }
+        })
+    }
+
     fn run_loop(
         &mut self,
-        label: Option<&str>,
+        labels: &[&str],
         env: &Env,
         mut step: impl FnMut(&mut Interp, &Env) -> Result<LoopStep, Abrupt>,
     ) -> Completion {
@@ -801,12 +825,14 @@ impl Interp {
                     keep(bv, &mut v);
                     return Ok(v);
                 }
-                Err(Abrupt::Break(Some(l), bv)) if Some(l.as_str()) == label => {
+                Err(Abrupt::Break(Some(l), bv)) if labels.contains(&l.as_str()) => {
                     keep(bv, &mut v);
                     return Ok(v);
                 }
                 Err(Abrupt::Continue(None, bv)) => keep(bv, &mut v),
-                Err(Abrupt::Continue(Some(l), bv)) if Some(l.as_str()) == label => keep(bv, &mut v),
+                Err(Abrupt::Continue(Some(l), bv)) if labels.contains(&l.as_str()) => {
+                    keep(bv, &mut v)
+                }
                 // A break/continue targeting an outer label: thread this loop's V outward.
                 Err(e) => return Err(crate::interpreter::update_abrupt_empty(e, v)),
             }
@@ -820,7 +846,7 @@ impl Interp {
         update: &Option<Expr>,
         body: &Stmt,
         env: &Env,
-        label: Option<&str>,
+        labels: &[&str],
     ) -> Completion {
         let loop_env = new_scope(Some(env.clone()));
         // A `for (using x = r; …)` head is a disposal boundary: its resources are disposed once,
@@ -839,7 +865,7 @@ impl Interp {
         if dispose_async.is_some() {
             self.using_stack.push(Vec::new());
         }
-        let result = self.exec_c_for_body(init, test, update, body, &loop_env, label);
+        let result = self.exec_c_for_body(init, test, update, body, &loop_env, labels);
         if let Some(is_async) = dispose_async {
             let frame = self.using_stack.pop().unwrap_or_default();
             return self.dispose_frame_maybe_async(frame, result, is_async);
@@ -855,7 +881,7 @@ impl Interp {
         update: &Option<Expr>,
         body: &Stmt,
         loop_env: &Env,
-        label: Option<&str>,
+        labels: &[&str],
     ) -> Completion {
         if let Some(init) = init {
             match init.as_ref() {
@@ -937,7 +963,7 @@ impl Interp {
             copy_env(loop_env)
         };
         let mut first = true;
-        self.run_loop(label, loop_env, |me, _env| {
+        self.run_loop(labels, loop_env, |me, _env| {
             if !first {
                 if !per_iter.is_empty() {
                     cur_env = copy_env(&cur_env);
@@ -968,7 +994,7 @@ impl Interp {
         is_await: bool,
         body: &Stmt,
         env: &Env,
-        label: Option<&str>,
+        labels: &[&str],
     ) -> Completion {
         // A lexical head's bound names are already in scope — uninitialized (TDZ) — while the
         // RHS evaluates, so `for (const x of x)` is a ReferenceError.
@@ -1037,7 +1063,7 @@ impl Interp {
             // A failure in the iteration step itself marks the iterator done — only abrupt
             // completions from the loop body (or an early break/return) close it afterwards.
             let (mut exhausted, mut step_failed) = (false, false);
-            let result = self.run_loop(label, env, |me, env| {
+            let result = self.run_loop(labels, env, |me, env| {
                 step_failed = true;
                 let res = me.call(next.clone(), iter.clone(), &[])?;
                 // Await the step result by parking the coroutine (real microtask ticks).
@@ -1106,7 +1132,7 @@ impl Interp {
             // A failure in the iteration step itself (next throwing, a non-object result, or a
             // `value` getter throwing) marks the iterator done: it is NOT closed.
             let mut step_failed = false;
-            let result = self.run_loop(label, env, |me, env| {
+            let result = self.run_loop(labels, env, |me, env| {
                 step_failed = true;
                 let v = match me.iterator_step(&iter, &next)? {
                     Some(x) => x,
@@ -1149,7 +1175,7 @@ impl Interp {
             .map(Value::from_string)
             .collect();
         let mut idx = 0;
-        self.run_loop(label, env, |me, env| {
+        self.run_loop(labels, env, |me, env| {
             // A property deleted while the enumeration is under way is not visited.
             let v = loop {
                 if idx >= items.len() {
@@ -1851,6 +1877,20 @@ impl Interp {
             }
             cur = parent;
         }
+        // Fast path: an own data property of an ordinary global (the overwhelmingly common
+        // resolution for builtins and script-level bindings) — one hash lookup, no trap walk.
+        if self.ordinary_get_ptr(Rc::as_ptr(&self.global) as usize) {
+            let b = self.global.borrow();
+            if matches!(b.exotic, crate::value::Exotic::None) {
+                if let Some(p) = b.props.get(name) {
+                    if !p.accessor {
+                        let v = p.value.clone();
+                        drop(b);
+                        return Ok((v, None));
+                    }
+                }
+            }
+        }
         // Fall back to a property of the global object (where builtins live). The lookup is the
         // full trap-aware [[HasProperty]]: the global's prototype may be (or contain) a proxy.
         let g = Value::Obj(self.global.clone());
@@ -2272,25 +2312,6 @@ impl Interp {
         }
     }
 
-    pub(crate) fn has_property(&self, obj: &Gc, key: &str) -> bool {
-        // A TypedArray's [[HasProperty]] resolves integer-index slots itself and never consults the
-        // prototype for a canonical-numeric key (valid index → present; otherwise absent).
-        if let Some(info) = self.typed_arrays.get(&(Rc::as_ptr(obj) as usize)).copied() {
-            match self.ta_index_kind(&info, key) {
-                TaIndex::Element(_) => return true,
-                TaIndex::Exotic => return false,
-                TaIndex::Ordinary => {}
-            }
-        }
-        let mut cur = Some(obj.clone());
-        while let Some(o) = cur {
-            if o.borrow().props.contains(key) {
-                return true;
-            }
-            cur = o.borrow().proto.clone();
-        }
-        false
-    }
 
     // ----- expressions ------------------------------------------------------------------------
 
@@ -2472,10 +2493,15 @@ impl Interp {
                                 }
                             }
                         }
+                        // Capture the importing module's `import.meta` lexically (the
+                        // `%importmeta%` binding), so the referrer is correct even when this
+                        // `import()` runs from an async continuation after `await`.
+                        let referrer = self.peek_binding("%importmeta%", env);
                         Ok(self.dynamic_import(
                             &s,
                             attr_type.as_deref(),
                             matches!(phase, ImportPhase::Defer),
+                            referrer,
                         ))
                     }
                 }
@@ -3400,6 +3426,11 @@ impl Interp {
             }
             _ => return,
         };
+        // A rejection with no reactions attached yet is (so far) unhandled — track it. A later
+        // `.then`/`.catch` clears it (see `promise_then_into`).
+        if !fulfilled && reactions.is_empty() {
+            self.unhandled_rejections.insert(ptr, value.clone());
+        }
         for (on_f, on_r, result) in reactions {
             let handler = if fulfilled { on_f } else { on_r };
             self.microtasks.push_back(Job {
@@ -3432,6 +3463,8 @@ impl Interp {
             _ => return,
         };
         let status = self.promises.get(&ptr).map(|s| s.status).unwrap_or(0);
+        // Attaching a handler marks the rejection handled (HostPromiseRejectionTracker "handle").
+        self.unhandled_rejections.remove(&ptr);
         match status {
             0 => {
                 if let Some(s) = self.promises.get_mut(&ptr) {
@@ -4786,12 +4819,12 @@ impl Interp {
                 self.super_call_ok = saved_super;
                 r
             }
-            Callable::Native(f) => {
+            Callable::Native(_) | Callable::NativeData(_) => {
                 // Native parent (e.g. Error/Map): a super() call is a construct, so set the flag for
                 // constructors that require `new`. Run it, then graft its own props onto `this`.
                 let saved = self.constructing;
                 self.constructing = true;
-                let made = f(self, this.clone(), args).map_err(Abrupt::Throw);
+                let made = self.dispatch_native(&call, this.clone(), args).map_err(Abrupt::Throw);
                 self.constructing = saved;
                 let made = made?;
                 if let (Value::Obj(src), Value::Obj(dst)) = (&made, this) {
@@ -4825,6 +4858,7 @@ impl Interp {
                             self.map_data.insert(dp, v);
                         }
                         if let Some(v) = self.typed_arrays.remove(&sp) {
+                            self.inline_ic_safe.set(false);
                             self.typed_arrays.insert(dp, v);
                         }
                         // The TypedArray's `buffer` slot lives in a parallel side table keyed by the
@@ -6486,7 +6520,7 @@ impl Interp {
         let b = o.borrow();
         match &b.call {
             Callable::User(f, _) => !(f.is_arrow || f.is_method || f.is_generator || f.is_async),
-            Callable::Native(_) => {
+            Callable::Native(_) | Callable::NativeData(_) => {
                 b.is_constructor
                     || b.props
                         .get("prototype")

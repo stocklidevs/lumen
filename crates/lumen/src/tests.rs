@@ -1155,6 +1155,37 @@ fn label_validation() {
     assert_eq!(run("x: 1; x: 2; 'ok'"), "ok"); // sequential same label is fine
 }
 #[test]
+fn labelled_continue_while() {
+    // Regression: a labelled `continue` targeting a while/do-while used to escape the loop as an
+    // uncaught completion and silently terminate the script (issue #4). It must restart the loop.
+    assert_eq!(
+        run("var i=0; a: while(i<3){ i++; continue a; } i"),
+        "3"
+    );
+    assert_eq!(
+        run("var i=0; a: do { i++; continue a; } while(i<3); i"),
+        "3"
+    );
+    // Labelled `break` on a while/do-while keeps working.
+    assert_eq!(run("var i=0; a: while(i<3){ i++; break a; } i"), "1");
+    assert_eq!(run("var i=0; a: do { i++; break a; } while(i<3); i"), "1");
+    // Inner while `continue`s the outer label: the outer loop advances, the inner is abandoned.
+    assert_eq!(
+        run("var log=[]; a: for(var i=0;i<3;i++){ var j=0; while(j<3){ j++; if(j===2) continue a; log.push(i+':'+j);} } log.join(',')"),
+        "0:1,1:1,2:1"
+    );
+    // Labelled continue on an outer while, driven from an inner while.
+    assert_eq!(
+        run("var n=0; a: while(n<3){ n++; var k=0; while(k<5){ k++; continue a; } } n"),
+        "3"
+    );
+    // Completion value threading: the loop's value is the last non-empty body completion.
+    assert_eq!(
+        run("var i=0; a: while(i<3){ i++; if(i<3){ i; continue a; } 42; }"),
+        "42"
+    );
+}
+#[test]
 fn named_eval_defaults() {
     assert_eq!(run("var {a=function(){}}={}; a.name"), "a");
     assert_eq!(run("var [b=()=>{}]=[]; b.name"), "b");
@@ -1901,6 +1932,186 @@ fn promise_combinators_async() {
         "9"
     );
 }
+/// A test-only native that flips the interpreter's tail-call-eligibility flag on. It stands in
+/// for the promise-reaction machinery, which can leave `tco_ok == true` ambient while a coroutine
+/// body is running.
+fn leak_tco(
+    i: &mut crate::interpreter::Interp,
+    _this: crate::value::Value,
+    _args: &[crate::value::Value],
+) -> Result<crate::value::Value, crate::value::Value> {
+    i.tco_ok = true;
+    Ok(crate::value::Value::Undefined)
+}
+
+#[test]
+fn async_tail_return_survives_leaked_tco() {
+    // Regression: a coroutine (async/generator) body runs outside `Interp::call`'s tail-call
+    // trampoline, so a top-level `return f(...)` there must NOT be treated as a proper tail call —
+    // it would be parked as a pending tail call that nothing runs, resolving the async function to
+    // `undefined`. `tco_ok` is ambient state a promise reaction can leave set to `true`, so the
+    // body forces it off before each statement. Here `__leakTco()` reproduces that leaked state
+    // after an `await`, and the following tail-call `return` must still yield its real value.
+    let mut e = Engine::new();
+    let global = e.interp.global.clone();
+    e.interp.def_method(&global, "__leakTco", 0, leak_tco);
+    e.eval(
+        "function id(x){ return x; }\n\
+         var out = 'unset';\n\
+         (async () => { await null; __leakTco(); return id('kept'); })().then((v) => { out = v; });",
+        false,
+    )
+    .expect("parse");
+    assert_eq!(
+        match e.eval("out", false).expect("parse") {
+            Completion::Value(v) => v,
+            Completion::Throw { name, message } => panic!("threw {name}: {message}"),
+        },
+        "kept"
+    );
+}
+
+#[test]
+fn bytecode_property_inline_cache() {
+    // Exercise the GetProp/SetProp inline caches under the bytecode tier: repeated access at one
+    // site across same- and different-shaped objects (slot revalidation), accessor shadowing (must
+    // run the getter, not read a raw slot), own-shadows-proto + delete falling back to the proto,
+    // and writes through the SetProp cache.
+    let mut e = Engine::new();
+    e.interp.tier = crate::bytecode::Tier::Bytecode;
+    e.interp.tier_threshold = 0; // compile on first call so the caches are exercised
+    let src = r#"
+      function readXY(o){ return o.x + "," + o.y; }
+      let a = "";
+      for (let i=0;i<5;i++) a += readXY({ x: i, y: i*2 }) + ";"; // monomorphic hits
+      a += readXY({ z: 9, y: 100, x: 200 }) + ";";                // different slots -> revalidate
+      a += readXY({ x: 1, get y(){ return 42; } }) + ";";          // accessor -> run getter
+      const proto = { x: "PX" };
+      const obj = Object.create(proto); obj.x = "OWN";
+      function readX(o){ return o.x; }
+      let b = readX(obj); delete obj.x; b += "," + readX(obj);      // own, then proto after delete
+      function bump(o){ o.n = o.n + 1; return o.n; }
+      const c1 = { n: 10 }, c2 = { n: 20 };
+      let w = bump(c1) + "," + bump(c2) + "," + bump(c1);          // SetProp cache across objects
+      a + "|" + b + "|" + w;
+    "#;
+    let got = match e.eval(src, false).expect("parse") {
+        Completion::Value(v) => v,
+        Completion::Throw { name, message } => panic!("threw {name}: {message}"),
+    };
+    assert_eq!(got, "0,0;1,2;2,4;3,6;4,8;200,100;1,42;|OWN,PX|11,21,12");
+}
+
+#[test]
+fn bytecode_compiles_labelled_loops() {
+    // Labelled loops used to bail out of the compiler (falling back to the interpreter). They now
+    // compile to the fast tier: assert `compile` actually produces a chunk rather than `None`.
+    fn compiles(src: &str) -> bool {
+        let stmts = crate::parser::parse_script(src, false).ok().expect("parse");
+        let func = stmts
+            .iter()
+            .find_map(|s| match s {
+                crate::ast::Stmt::FuncDecl(f) => Some(f.clone()),
+                _ => None,
+            })
+            .expect("a function declaration");
+        crate::bytecode::compile(&func).is_some()
+    }
+    assert!(compiles("function f(){ var i=0; a: while(i<3){ i++; continue a; } }"));
+    assert!(compiles("function f(){ a: do { break a; } while(false); }"));
+    assert!(compiles("function f(){ a: for(;;){ continue a; } }"));
+    assert!(compiles("function f(){ var r=0; a: b: for(var i=0;i<2;i++){ continue a; } }"));
+    assert!(compiles(
+        "function f(){ outer: for(var i=0;i<2;i++){ for(var j=0;j<2;j++){ continue outer; } } }"
+    ));
+    // A label on a non-loop statement stays outside the compiled subset (bails to the interpreter).
+    assert!(!compiles("function f(){ a: { break a; } }"));
+}
+
+#[test]
+fn bytecode_labelled_loops_match_interp() {
+    // The compiled labelled-loop behavior must match the tree-walker exactly. Run each snippet on
+    // both tiers (threshold 0 forces immediate compilation) and require identical results.
+    fn on_tier(src: &str, tier: crate::bytecode::Tier) -> String {
+        let mut e = Engine::new();
+        e.interp.tier = tier;
+        e.interp.tier_threshold = 0;
+        match e.eval(src, false).expect("parse") {
+            Completion::Value(v) => v,
+            Completion::Throw { name, message } => panic!("threw {name}: {message}"),
+        }
+    }
+    for src in [
+        "function f(){ var i=0; a: while(i<3){ i++; continue a; } return i; } f()",
+        "function f(){ var i=0; a: do { i++; continue a; } while(i<3); return i; } f()",
+        "function f(){ var n=0; a: while(n<5){ n++; if(n===3) break a; } return n; } f()",
+        "function f(){ var r=0; a: b: for(var i=0;i<4;i++){ if(i===2) continue a; r+=i; } return r; } f()",
+        "function f(){ var s=0; outer: for(var i=0;i<3;i++){ for(var j=0;j<3;j++){ if(j===1) continue outer; s+=10*i+j; } } return s; } f()",
+        "function f(){ var s=''; a: for(var i=0;i<3;i++){ for(var j=0;j<3;j++){ if(j===1) break a; s+=i+''+j; } } return s; } f()",
+    ] {
+        let interp = on_tier(src, crate::bytecode::Tier::Interp);
+        let bytecode = on_tier(src, crate::bytecode::Tier::Bytecode);
+        assert_eq!(interp, bytecode, "tier mismatch for: {src}");
+    }
+}
+
+#[test]
+fn bytecode_async_vm() {
+    // Async bodies compile to the bytecode VM and suspend at `await` without an OS-thread
+    // coroutine. Checks the awaited value flows back, `await` in a loop accumulates, the return
+    // value is delivered, and `await` still yields a microtask tick (ordering "123", not "132").
+    let mut e = Engine::new();
+    e.interp.tier = crate::bytecode::Tier::Bytecode;
+    e.interp.tier_threshold = 0; // compile every function so the VM async path is taken
+    let src = r#"
+      var out = "";
+      async function add(a, b){ return a + await Promise.resolve(b); }
+      async function chain(){ let s = 0; for (let i=0;i<4;i++) s += await add(i, 10); return s; }
+      const order = [];
+      async function stepper(){ order.push(1); await 0; order.push(3); }
+      async function main(){
+        const c = await chain();          // 10+11+12+13 = 46
+        const p = stepper(); order.push(2); await p;
+        out = c + "|" + order.join("");
+      }
+      main();
+    "#;
+    e.eval(src, false).expect("parse");
+    let got = match e.eval("out", false).expect("parse") {
+        Completion::Value(v) => v,
+        Completion::Throw { name, message } => panic!("threw {name}: {message}"),
+    };
+    assert_eq!(got, "46|123");
+}
+
+#[test]
+fn bytecode_try_catch() {
+    // try/catch compiles to the VM: a thrown value / native throw is caught, nested try rethrows to
+    // the outer catch, `return` inside try still returns, and — the reason Hono's async `compose`
+    // now compiles — a rejected `await` inside a `try` lands in its `catch`.
+    let mut e = Engine::new();
+    e.interp.tier = crate::bytecode::Tier::Bytecode;
+    e.interp.tier_threshold = 0;
+    let src = r#"
+      function f(x){ try { if (x<0) throw "neg"+x; return "ok"+x; } catch(e){ return "c:"+e; } }
+      function native(){ try { null.x; } catch(e){ return e.constructor.name; } }
+      function nested(){ try { try { throw "in"; } catch(e){ throw e+"!"; } } catch(e){ return "out:"+e; } }
+      function noParam(){ try { throw 1; } catch { return "swallowed"; } }
+      var out = "";
+      async function ar(x){ try { return await Promise.reject("r"+x); } catch(e){ return "ac:"+e; } }
+      async function main(){
+        out = [f(2), f(-1), native(), nested(), noParam(), await ar(9)].join("|");
+      }
+      main();
+    "#;
+    e.eval(src, false).expect("parse");
+    let got = match e.eval("out", false).expect("parse") {
+        Completion::Value(v) => v,
+        Completion::Throw { name, message } => panic!("threw {name}: {message}"),
+    };
+    assert_eq!(got, "ok2|c:neg-1|TypeError|out:in!|swallowed|ac:r9");
+}
+
 #[test]
 fn array_species() {
     assert_eq!(run("[1,2,3].map(x=>x*2).join(',')"), "2,4,6");
@@ -3262,6 +3473,26 @@ fn number_methods_fixed() {
         ("(1).toPrecision(5)", "1.0000"),
         ("(255).toString(16)", "ff"),
         ("(123.456).toExponential(2)", "1.23e+2"),
+        // toFixed rounds half *up* (ties toward the larger n), not half-to-even (issue #5).
+        ("(0.5).toFixed(0)", "1"),
+        ("(2.5).toFixed(0)", "3"),
+        ("(4.5).toFixed(0)", "5"),
+        ("(1.25).toFixed(1)", "1.3"),
+        ("(-2.5).toFixed(0)", "-3"),
+        // Ties are judged on the exact binary64 value: these only *look* like halves, so they
+        // round down (0.15 is really 0.1499…, 1.005 is 1.00499…, 8.575 is 8.57499…).
+        ("(0.15).toFixed(1)", "0.1"),
+        ("(0.35).toFixed(1)", "0.3"),
+        ("(0.045).toFixed(2)", "0.04"),
+        ("(1.005).toFixed(2)", "1.00"),
+        ("(8.575).toFixed(2)", "8.57"),
+        ("(9.995).toFixed(2)", "9.99"),
+        // Rounding up must propagate the carry across a run of nines.
+        ("(0.996).toFixed(2)", "1.00"),
+        ("(9.5).toFixed(0)", "10"),
+        ("(99.5).toFixed(0)", "100"),
+        // Exact expansion at high precision stays faithful (no spurious rounding).
+        ("(1234.5678).toFixed(20)", "1234.56780000000003383320"),
     ];
     for (src, want) in cases {
         assert_eq!(run(src), want, "{src}");
@@ -3477,6 +3708,39 @@ fn array_isarray_proxy() {
     assert_eq!(run("Array.isArray(new Proxy({},{}))"), "false");
     assert_eq!(run("Array.isArray([])"), "true");
     assert_eq!(run("Array.isArray({})"), "false");
+}
+#[test]
+fn array_iteration_proxy_receiver() {
+    // Regression (issue #6): every/some must run [[HasProperty]] through the proxy's traps, not
+    // peek at the proxy object's own (empty) property table — otherwise every index reads as a hole
+    // and the callback never fires.
+    assert_eq!(
+        run(
+            "var calls=0; var p=new Proxy({length:2,0:'a',1:'b'},{get(o,k){return o[k];}});\
+             Array.prototype.every.call(p,function(){calls++;return true;});\
+             Array.prototype.some.call(p,function(){calls++;return false;});\
+             calls"
+        ),
+        "4"
+    );
+    // The `has` trap participates in the hole check: reporting an index absent skips it.
+    assert_eq!(
+        run(
+            "var calls=0; var p=new Proxy({length:3,0:1,1:2,2:3},{has(o,k){return k!=='1';}});\
+             Array.prototype.forEach.call(p,function(){calls++;});\
+             calls"
+        ),
+        "2"
+    );
+    // every short-circuits false and some short-circuits true, both through proxy reads.
+    assert_eq!(
+        run("var p=new Proxy({length:3,0:2,1:4,2:5},{}); Array.prototype.every.call(p,x=>x%2===0)"),
+        "false"
+    );
+    assert_eq!(
+        run("var p=new Proxy({length:3,0:1,1:3,2:4},{}); Array.prototype.some.call(p,x=>x%2===0)"),
+        "true"
+    );
 }
 #[test]
 fn arraybuffer_length_validation() {
@@ -8750,6 +9014,33 @@ fn collator_three_level_compare() {
     );
 }
 
+#[test]
+fn cldr_unit_patterns_correct_ids() {
+    // Regression (issue #7): the CLDR table matched unit ids by bare suffix and picked up
+    // unrelated compound units — `second` -> acceleration-meter-per-square-second,
+    // `centimeter` -> area-square-centimeter, `minute` -> angle-arc-minute, etc.
+    let unit = |u: &str, disp: &str| {
+        run(&format!(
+            "new Intl.NumberFormat('en',{{style:'unit',unit:'{u}',unitDisplay:'{disp}'}}).format(5)"
+        ))
+    };
+    assert_eq!(unit("second", "long"), "5 seconds");
+    assert_eq!(unit("second", "short"), "5 sec");
+    assert_eq!(unit("meter", "long"), "5 meters");
+    assert_eq!(unit("meter", "short"), "5 m");
+    assert_eq!(unit("centimeter", "long"), "5 centimeters");
+    assert_eq!(unit("minute", "long"), "5 minutes");
+    assert_eq!(unit("mile", "long"), "5 miles");
+    assert_eq!(unit("liter", "long"), "5 liters");
+    assert_eq!(unit("gallon", "long"), "5 gallons");
+    // Genuine compound speed units still resolve.
+    assert_eq!(unit("kilometer-per-hour", "long"), "5 kilometers per hour");
+    // DurationFormat composes the same corrected patterns.
+    assert_eq!(
+        run("new Intl.DurationFormat('en',{style:'long'}).format({hours:1,minutes:46,seconds:40})"),
+        "1 hour, 46 minutes, 40 seconds"
+    );
+}
 #[test]
 fn numberformat_exact_decimal_inputs() {
     // A BigInt beyond 2^53 keeps its exact digits.

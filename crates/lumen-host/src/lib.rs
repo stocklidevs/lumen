@@ -19,8 +19,11 @@ use std::collections::VecDeque;
 use std::sync::mpsc;
 
 pub use lumen::bytecode::Tier;
-pub use lumen::embed::{Ctx, NativeFn, OpState, ResourceId, ResourceTable, Value};
+pub use lumen::embed::{Ctx, NativeClosure, NativeFn, OpState, ResourceId, ResourceTable, Value};
 pub use lumen::{Completion, Engine, ParseError};
+
+/// DEFLATE/zlib/gzip codec (std-only), shared by web CompressionStream and node:zlib.
+pub mod deflate;
 
 /// One native op: a named native function with its JS arity.
 #[derive(Clone, Copy)]
@@ -54,6 +57,11 @@ pub struct Extension {
     /// public API is JS wrapping raw callback ops (e.g. `fs.promises` over `__fs_async`).
     /// A parse/throw here is a bug in the extension: `install` panics with its name.
     pub js_init: Option<&'static str>,
+    /// A build-time snapshot of `js_init`'s parsed AST (see `Engine::eval_snapshot`). When
+    /// present, `install` decodes it instead of re-lexing/parsing `js_init` every boot — the
+    /// dominant cold-start cost. A decode failure (version skew) falls back to `js_init`, so it
+    /// is a pure optimization. `js_init` must still be set (the fallback source).
+    pub js_init_snapshot: Option<&'static [u8]>,
 }
 
 impl Extension {
@@ -65,6 +73,7 @@ impl Extension {
             namespaces: &[],
             state_init: None,
             js_init: None,
+            js_init_snapshot: None,
         }
     }
 }
@@ -85,7 +94,14 @@ pub fn install(engine: &mut Engine, extensions: &[Extension]) {
             engine.define_namespace(ns, &table);
         }
         if let Some(src) = ext.js_init {
-            match engine.eval(src, false) {
+            // Prefer the precompiled snapshot (skips lex+parse); on a decode failure fall back to
+            // parsing the source, so the snapshot can never change behavior — only speed.
+            let completion = ext
+                .js_init_snapshot
+                .and_then(|bytes| engine.eval_snapshot(bytes, false).ok())
+                .map(Ok)
+                .unwrap_or_else(|| engine.eval(src, false));
+            match completion {
                 Ok(Completion::Value(_)) => {}
                 Ok(Completion::Throw { name, message }) => {
                     panic!("extension '{}' js_init threw {name}: {message}", ext.name)
@@ -225,6 +241,35 @@ impl SpawnHandle {
     }
 }
 
+/// Sends [`TaskCompletion`]s straight to the loop from a *dedicated* thread, bypassing the fixed
+/// [`ThreadPool`]. For work that blocks for an unbounded time — a subprocess's stdout read, waiting
+/// on a child to exit — where occupying a shared pool worker for the whole duration would starve
+/// everything else. The runtime stores one in [`OpState`]. `run_blocking` spawns a fresh thread per
+/// call; blocked threads cost only memory, not a pool slot.
+#[derive(Clone)]
+pub struct CompletionSender {
+    tx: mpsc::Sender<TaskCompletion>,
+}
+
+impl CompletionSender {
+    pub fn new(tx: mpsc::Sender<TaskCompletion>) -> CompletionSender {
+        CompletionSender { tx }
+    }
+    /// Run `work` on a new dedicated thread; its result comes back to the loop as a
+    /// [`TaskCompletion`] tagged with `id` (settled through the [`TaskRegistry`], like pool work).
+    pub fn run_blocking(
+        &self,
+        id: TaskId,
+        work: impl FnOnce() -> Box<dyn Any + Send> + Send + 'static,
+    ) {
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let result = work();
+            let _ = tx.send(TaskCompletion { task: id, result });
+        });
+    }
+}
+
 /// Turns a completed task's `Send` payload back into JS callback arguments, on the loop
 /// thread. `Err` is a JS value to report as an uncaught exception (later: a rejection).
 pub type TaskDecoder = fn(&mut Ctx, Box<dyn Any + Send>) -> Result<Vec<Value>, Value>;
@@ -245,6 +290,9 @@ pub struct TaskEntry {
     pub on_ok: Value,
     pub on_err: Option<Value>,
     pub decode: TaskDecoder,
+    /// An `unref`'d task still settles when it completes, but does not by itself keep the event
+    /// loop alive (Node's `child.unref()` — e.g. esbuild's persistent service child).
+    pub unref: bool,
 }
 
 impl TaskRegistry {
@@ -258,6 +306,7 @@ impl TaskRegistry {
                 on_ok,
                 on_err,
                 decode,
+                unref: false,
             },
         );
         id
@@ -266,8 +315,25 @@ impl TaskRegistry {
     pub fn take(&mut self, id: TaskId) -> Option<TaskEntry> {
         self.map.remove(&id)
     }
+    /// Mark a pending task as `unref`'d (see [`TaskEntry::unref`]).
+    pub fn set_unref(&mut self, id: TaskId) {
+        if let Some(e) = self.map.get_mut(&id) {
+            e.unref = true;
+        }
+    }
+    /// Re-`ref` a pending task so it keeps the loop alive again (Node's `handle.ref()`).
+    pub fn set_ref(&mut self, id: TaskId) {
+        if let Some(e) = self.map.get_mut(&id) {
+            e.unref = false;
+        }
+    }
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
+    }
+    /// Whether any *ref*'d (loop-keeping) task is pending. Unref'd tasks are ignored — they
+    /// settle if they complete but must not hold the process open.
+    pub fn has_ref_pending(&self) -> bool {
+        self.map.values().any(|e| !e.unref)
     }
 }
 

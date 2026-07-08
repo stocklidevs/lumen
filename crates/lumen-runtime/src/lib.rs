@@ -19,11 +19,13 @@ use std::sync::mpsc;
 use std::time::Instant;
 
 use lumen_host::{
-    install, CallbackQueue, Engine, TaskCompletion, TaskDecoder, TaskRegistry, ThreadPool, Value,
+    install, CallbackQueue, CompletionSender, Engine, TaskCompletion, TaskDecoder, TaskRegistry,
+    ThreadPool, Value,
 };
 
 mod console;
 mod esm;
+mod jsx;
 mod process;
 
 pub use console::{describe_error, render_value, ConsoleOut};
@@ -49,10 +51,13 @@ impl Runtime {
     /// `process`, `queueMicrotask`.
     pub fn new() -> Runtime {
         let (tx, rx) = mpsc::channel();
-        let pool = ThreadPool::new(POOL_SIZE, tx);
+        let pool = ThreadPool::new(POOL_SIZE, tx.clone());
         let mut engine = Engine::new();
         // Substrate first: fs's js_init runs during install and its ops need these.
         engine.ctx().op_state().put(pool.handle());
+        // Dedicated-thread completions for unbounded-blocking work (child stdio) that must not
+        // occupy a shared pool worker.
+        engine.ctx().op_state().put(CompletionSender::new(tx));
         engine.ctx().op_state().put(TaskRegistry::default());
         install(
             &mut engine,
@@ -120,6 +125,12 @@ impl Runtime {
     pub fn run_module(&mut self, path: &str) -> Result<(), String> {
         let source =
             std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
+        // A `.jsx` entry is lowered to plain JS before the engine parses it.
+        let source = if path.ends_with(".jsx") {
+            jsx::transform(&source).map_err(|e| format!("JSX transform failed for {path}: {e}"))?
+        } else {
+            source
+        };
         let key = std::fs::canonicalize(path)
             .unwrap_or_else(|_| std::path::PathBuf::from(path))
             .to_string_lossy()
@@ -197,6 +208,7 @@ impl Runtime {
             // Run everything already runnable. Each JS entry is followed by a microtask
             // checkpoint, matching the "after every macrotask" model.
             self.engine.run_microtasks();
+            self.report_unhandled_rejections();
             loop {
                 let mut progressed = false;
                 for (cb, args) in self.take_queued_callbacks() {
@@ -251,7 +263,7 @@ impl Runtime {
         let timers_pending = state
             .get::<lumen_timers::Timers>()
             .is_some_and(|t| t.has_pending());
-        let tasks_pending = state.get::<TaskRegistry>().is_some_and(|r| !r.is_empty());
+        let tasks_pending = state.get::<TaskRegistry>().is_some_and(|r| r.has_ref_pending());
         !callbacks_queued && !timers_pending && !tasks_pending
     }
 
@@ -296,6 +308,7 @@ impl Runtime {
             },
         }
         self.engine.run_microtasks();
+        self.report_unhandled_rejections();
     }
 
     /// One JS callback entry: call, report an uncaught throw, then the microtask checkpoint.
@@ -304,6 +317,7 @@ impl Runtime {
             self.report_uncaught(&e);
         }
         self.engine.run_microtasks();
+        self.report_unhandled_rejections();
     }
 
     /// An exception escaped a loop-fired callback. Node prints and keeps the loop alive (we
@@ -311,6 +325,15 @@ impl Runtime {
     fn report_uncaught(&mut self, error: &Value) {
         let text = console::describe_error(self.engine.ctx(), error);
         console::write_err_line(self.engine.ctx(), format!("Uncaught {text}"));
+    }
+
+    /// Report promises rejected without a handler (Node prints `Uncaught (in promise) …`). Called
+    /// after each microtask checkpoint; a rejection handled in the same checkpoint won't appear.
+    fn report_unhandled_rejections(&mut self) {
+        for reason in self.engine.take_unhandled_rejections() {
+            let text = console::describe_error(self.engine.ctx(), &reason);
+            console::write_err_line(self.engine.ctx(), format!("Uncaught (in promise) {text}"));
+        }
     }
 }
 
